@@ -73,16 +73,11 @@ async def model_selection(callback_query: types.CallbackQuery):
     model_id = callback_query.data.split("_", 1)[1]; user_id = callback_query.from_user.id
     if user_id not in user_state or not user_state[user_id].get("provider"): await callback_query.answer("Ошибка. Начните с /start"); return
     user_state[user_id]["model"] = model_id; await callback_query.message.edit_text(f"✅ Модель *{model_id}* выбрана.\n\nОтправьте свой вопрос.", parse_mode="Markdown")
-
-# ИСПРАВЛЕНО: Обработчик выбора провайдера для ИЗОБРАЖЕНИЙ
 @dp.callback_query(lambda c: c.data.startswith("image_provider_"))
 async def image_provider_selection(callback_query: types.CallbackQuery):
-    # ИСПРАВЛЕНО: Берем третий элемент (индекс 2) вместо второго
-    provider = callback_query.data.split("_")[2] 
-    user_id = callback_query.from_user.id
-    if user_id not in user_state: reset_user_state(user_id) # На всякий случай
-    user_state[user_id]["provider"] = provider
-    provider_name = ""
+    provider = callback_query.data.split("_")[2]; user_id = callback_query.from_user.id
+    if user_id not in user_state: reset_user_state(user_id)
+    user_state[user_id]["provider"] = provider; provider_name = ""
     if provider == "openai": provider_name = "DALL-E 3 (OpenAI)"
     elif provider == "grok": provider_name = "Grok Image (xAI)"
     await callback_query.message.edit_text(f"✅ Выбрана технология: *{provider_name}*.\n\nОтправьте промпт для генерации.", parse_mode="Markdown")
@@ -99,20 +94,57 @@ async def main_message_handler(message: Message):
 
 # Логика для текстового чата
 async def handle_text_chat(message: Message):
-    user_id = message.from_user.id; start_time = time.time(); provider = user_state[user_id]["provider"]; model_id = user_state[user_id]["model"]; user_input = message.text.strip(); history = user_state[user_id].get("history", []); answer = ""
-    if not model_id: await message.answer("Сначала выберите модель."); return
-    logging.info(f"Received text message from user_id: {user_id}"); await message.chat.do("typing")
+    user_id = message.from_user.id
+    if not user_state[user_id].get("model"):
+        await message.answer("Сначала выберите модель.")
+        return
+
+    logging.info(f"Received text message from user_id: {user_id}")
+    start_time = time.time()
+    provider = user_state[user_id]["provider"]
+    model_id = user_state[user_id]["model"]
+    user_input = message.text.strip()
+    history = user_state[user_id].get("history", [])
+    if len(history) > MAX_HISTORY_LENGTH: history = history[-MAX_HISTORY_LENGTH:]
+
+    await message.chat.do("typing")
+    answer = ""
+    
     try:
         if provider == "openai":
-            history.append({"role": "user", "content": user_input}); response = await openai_client.chat.completions.create(model=model_id, messages=history); answer = response.choices[0].message.content; history.append({"role": "assistant", "content": answer})
+            history.append({"role": "user", "content": user_input})
+            response = await openai_client.chat.completions.create(model=model_id, messages=history)
+            answer = response.choices[0].message.content
+            history.append({"role": "assistant", "content": answer})
+
         elif provider == "grok":
-            history.append({"role": "user", "content": user_input}); def _generate_grok_chat(): chat_completion = xai_client.chat.create(model=model_id, messages=history); return chat_completion.choices[0].message.content
-            answer = await asyncio.to_thread(_generate_grok_chat); history.append({"role": "assistant", "content": answer})
+            # ИСПРАВЛЕНО: Синтаксис разделен на несколько строк
+            history.append({"role": "user", "content": user_input})
+            def _generate_grok_chat():
+                chat_completion = xai_client.chat.create(model=model_id, messages=history)
+                return chat_completion.choices[0].message.content
+            answer = await asyncio.to_thread(_generate_grok_chat)
+            history.append({"role": "assistant", "content": answer})
+            
         elif provider == "gemini":
-            gemini_model = genai.GenerativeModel(model_id); gemini_sdk_history = [{"role": "user" if msg["role"] == "user" else "model", "parts": [msg["content"]]} for msg in history]; chat_session = gemini_model.start_chat(history=gemini_sdk_history); response = await chat_session.send_message_async(user_input); answer = response.text; history.append({"role": "user", "content": user_input}); history.append({"role": "assistant", "content": answer})
-        duration = time.time() - start_time; logging.info(f"SUCCESS text chat for user_id: {user_id}. Provider: {provider}, Model: {model_id}. Duration: {duration:.2f}s")
-    except Exception as e: duration = time.time() - start_time; logging.exception(f"ERROR during text chat for user_id: {user_id}. Provider: {provider}. Error: {e}"); answer = f"❌ *Произошла ошибка.*\n\n_{str(e)}_."
-    user_state[user_id]["history"] = history; await message.answer(answer, parse_mode="Markdown")
+            gemini_model = genai.GenerativeModel(model_id)
+            gemini_sdk_history = [{"role": "user" if msg["role"] == "user" else "model", "parts": [msg["content"]]} for msg in history]
+            chat_session = gemini_model.start_chat(history=gemini_sdk_history)
+            response = await chat_session.send_message_async(user_input)
+            answer = response.text
+            history.append({"role": "user", "content": user_input})
+            history.append({"role": "assistant", "content": answer})
+
+        duration = time.time() - start_time
+        logging.info(f"SUCCESS text chat for user_id: {user_id}. Provider: {provider}, Model: {model_id}. Duration: {duration:.2f}s")
+    
+    except Exception as e:
+        duration = time.time() - start_time
+        logging.exception(f"ERROR during text chat for user_id: {user_id}. Provider: {provider}. Error: {e}")
+        answer = f"❌ *Произошла ошибка.*\n\n_{str(e)}_."
+
+    user_state[user_id]["history"] = history
+    await message.answer(answer, parse_mode="Markdown")
 
 # Логика для генерации изображений
 async def handle_image_generation(message: Message):
