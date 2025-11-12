@@ -73,9 +73,16 @@ async def model_selection(callback_query: types.CallbackQuery):
     model_id = callback_query.data.split("_", 1)[1]; user_id = callback_query.from_user.id
     if user_id not in user_state or not user_state[user_id].get("provider"): await callback_query.answer("Ошибка. Начните с /start"); return
     user_state[user_id]["model"] = model_id; await callback_query.message.edit_text(f"✅ Модель *{model_id}* выбрана.\n\nОтправьте свой вопрос.", parse_mode="Markdown")
+
+# ИСПРАВЛЕНО: Обработчик выбора провайдера для ИЗОБРАЖЕНИЙ
 @dp.callback_query(lambda c: c.data.startswith("image_provider_"))
 async def image_provider_selection(callback_query: types.CallbackQuery):
-    provider = callback_query.data.split("_")[1]; user_id = callback_query.from_user.id; user_state[user_id]["provider"] = provider; provider_name = ""
+    # ИСПРАВЛЕНО: Берем третий элемент (индекс 2) вместо второго
+    provider = callback_query.data.split("_")[2] 
+    user_id = callback_query.from_user.id
+    if user_id not in user_state: reset_user_state(user_id) # На всякий случай
+    user_state[user_id]["provider"] = provider
+    provider_name = ""
     if provider == "openai": provider_name = "DALL-E 3 (OpenAI)"
     elif provider == "grok": provider_name = "Grok Image (xAI)"
     await callback_query.message.edit_text(f"✅ Выбрана технология: *{provider_name}*.\n\nОтправьте промпт для генерации.", parse_mode="Markdown")
@@ -92,108 +99,47 @@ async def main_message_handler(message: Message):
 
 # Логика для текстового чата
 async def handle_text_chat(message: Message):
-    user_id = message.from_user.id
-    if not user_state[user_id].get("model"):
-        await message.answer("Сначала выберите модель, которой хотите задать вопрос.")
-        return
-
-    logging.info(f"Received text message from user_id: {user_id}")
-    start_time = time.time()
-    provider = user_state[user_id]["provider"]
-    model_id = user_state[user_id]["model"]
-    user_input = message.text.strip()
-    history = user_state[user_id].get("history", [])
-    if len(history) > MAX_HISTORY_LENGTH: history = history[-MAX_HISTORY_LENGTH:]
-
-    await message.chat.do("typing")
-    answer = ""
-    
+    user_id = message.from_user.id; start_time = time.time(); provider = user_state[user_id]["provider"]; model_id = user_state[user_id]["model"]; user_input = message.text.strip(); history = user_state[user_id].get("history", []); answer = ""
+    if not model_id: await message.answer("Сначала выберите модель."); return
+    logging.info(f"Received text message from user_id: {user_id}"); await message.chat.do("typing")
     try:
         if provider == "openai":
-            history.append({"role": "user", "content": user_input})
-            response = await openai_client.chat.completions.create(model=model_id, messages=history)
-            answer = response.choices[0].message.content
-            history.append({"role": "assistant", "content": answer})
-
+            history.append({"role": "user", "content": user_input}); response = await openai_client.chat.completions.create(model=model_id, messages=history); answer = response.choices[0].message.content; history.append({"role": "assistant", "content": answer})
         elif provider == "grok":
-            history.append({"role": "user", "content": user_input})
-            
-            # ИСПРАВЛЕНО: Синтаксис разделен на несколько строк
-            def _generate_grok_chat():
-                chat_completion = xai_client.chat.create(model=model_id, messages=history)
-                return chat_completion.choices[0].message.content
-            
-            answer = await asyncio.to_thread(_generate_grok_chat)
-            history.append({"role": "assistant", "content": answer})
-            
+            history.append({"role": "user", "content": user_input}); def _generate_grok_chat(): chat_completion = xai_client.chat.create(model=model_id, messages=history); return chat_completion.choices[0].message.content
+            answer = await asyncio.to_thread(_generate_grok_chat); history.append({"role": "assistant", "content": answer})
         elif provider == "gemini":
-            gemini_model = genai.GenerativeModel(model_id)
-            # Формат истории для Gemini SDK отличается
-            gemini_sdk_history = [{"role": "user" if msg["role"] == "user" else "model", "parts": [msg["content"]]} for msg in history]
-            chat_session = gemini_model.start_chat(history=gemini_sdk_history)
-            response = await chat_session.send_message_async(user_input)
-            answer = response.text
-            history.append({"role": "user", "content": user_input})
-            history.append({"role": "assistant", "content": answer})
-
-        duration = time.time() - start_time
-        logging.info(f"SUCCESS text chat for user_id: {user_id}. Provider: {provider}, Model: {model_id}. Duration: {duration:.2f}s")
-    
-    except Exception as e:
-        duration = time.time() - start_time
-        logging.exception(f"ERROR during text chat for user_id: {user_id}. Provider: {provider}. Error: {e}")
-        answer = f"❌ *Произошла ошибка при общении с нейросетью.*\n\n_{str(e)}_."
-
-    user_state[user_id]["history"] = history
-    await message.answer(answer, parse_mode="Markdown")
+            gemini_model = genai.GenerativeModel(model_id); gemini_sdk_history = [{"role": "user" if msg["role"] == "user" else "model", "parts": [msg["content"]]} for msg in history]; chat_session = gemini_model.start_chat(history=gemini_sdk_history); response = await chat_session.send_message_async(user_input); answer = response.text; history.append({"role": "user", "content": user_input}); history.append({"role": "assistant", "content": answer})
+        duration = time.time() - start_time; logging.info(f"SUCCESS text chat for user_id: {user_id}. Provider: {provider}, Model: {model_id}. Duration: {duration:.2f}s")
+    except Exception as e: duration = time.time() - start_time; logging.exception(f"ERROR during text chat for user_id: {user_id}. Provider: {provider}. Error: {e}"); answer = f"❌ *Произошла ошибка.*\n\n_{str(e)}_."
+    user_state[user_id]["history"] = history; await message.answer(answer, parse_mode="Markdown")
 
 # Логика для генерации изображений
 async def handle_image_generation(message: Message):
-    user_id = message.from_user.id
-    provider = user_state[user_id].get("provider")
+    user_id = message.from_user.id; provider = user_state[user_id].get("provider")
     if not provider: await message.answer("Сначала выберите технологию для генерации."); return
-
-    prompt = message.text.strip()
-    logging.info(f"User {user_id} requested an image with provider '{provider}'.")
-    await message.answer("🎨 Создаю изображение... Это может занять до минуты."); await message.chat.do("upload_photo")
+    prompt = message.text.strip(); logging.info(f"User {user_id} requested an image with provider '{provider}'."); await message.answer("🎨 Создаю изображение... Это может занять до минуты."); await message.chat.do("upload_photo")
     start_time = time.time()
-
     try:
-        image_url = ""
-        caption = ""
+        image_url, caption = "", ""
         if provider == "openai":
-            response = await openai_client.images.generate(model="dall-e-3", prompt=prompt, n=1, size="1024x1024")
-            image_url = response.data[0].url
-            caption = f"Изображение от DALL-E 3:\n«{prompt}»"
+            response = await openai_client.images.generate(model="dall-e-3", prompt=prompt, n=1, size="1024x1024"); image_url = response.data[0].url; caption = f"Изображение от DALL-E 3:\n«{prompt}»"
         elif provider == "grok":
-            def _generate_grok_image():
-                response = xai_client.image.sample(model="grok-2-image-1212", prompt=prompt, image_format="url")
-                return response.url
-            image_url = await asyncio.to_thread(_generate_grok_image)
-            caption = f"Изображение от Grok Image:\n«{prompt}»"
-        
+            def _generate_grok_image(): response = xai_client.image.sample(model="grok-2-image-1212", prompt=prompt, image_format="url"); return response.url
+            image_url = await asyncio.to_thread(_generate_grok_image); caption = f"Изображение от Grok Image:\n«{prompt}»"
         if image_url:
-            duration = time.time() - start_time
-            logging.info(f"SUCCESS image generation for user_id: {user_id}. Provider: {provider}. Duration: {duration:.2f}s")
-            await message.answer_photo(photo=image_url, caption=caption)
-        else:
-            raise Exception("Provider logic is not implemented")
-
+            duration = time.time() - start_time; logging.info(f"SUCCESS image generation for user_id: {user_id}. Provider: {provider}. Duration: {duration:.2f}s"); await message.answer_photo(photo=image_url, caption=caption)
+        else: raise Exception("Provider logic is not implemented")
     except Exception as e:
-        duration = time.time() - start_time
-        logging.exception(f"ERROR during image generation for user_id: {user_id}. Provider: {provider}")
-        error_text = str(e) if str(e) else "Произошла непредвиденная ошибка."
-        await message.answer(f"❌ *Ошибка при генерации изображения.*\n\n_{error_text}_", parse_mode="Markdown")
+        duration = time.time() - start_time; logging.exception(f"ERROR during image generation for user_id: {user_id}. Provider: {provider}")
+        error_text = str(e) if str(e) else "Произошла непредвиденная ошибка."; await message.answer(f"❌ *Ошибка при генерации изображения.*\n\n_{error_text}_", parse_mode="Markdown")
 
 # === Основная точка входа ===
 async def main():
     if not TELEGRAM_TOKEN: logging.error("Токен бота не найден!"); return
     await bot.delete_webhook(drop_pending_updates=True)
     logging.info("🤖 Бот запущен")
-    await bot.set_my_commands([
-        types.BotCommand(command="start", description="Перезапустить бота и выбрать режим"),
-        types.BotCommand(command="reset", description="Перезапустить бота и выбрать режим")
-    ])
+    await bot.set_my_commands([types.BotCommand(command="start", description="Перезапустить бота и выбрать режим"), types.BotCommand(command="reset", description="Перезапустить бота и выбрать режим")])
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
