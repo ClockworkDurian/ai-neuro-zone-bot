@@ -10,6 +10,7 @@ from xai_sdk import Client as XAI_Client
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
+from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 
 # === Настройки ===
@@ -23,7 +24,7 @@ openai_client = openai.AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 xai_client = XAI_Client(api_key=os.getenv("GROK_API_KEY"))
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
-bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode='HTML'))
 dp = Dispatcher()
 
 # === Состояние пользователей и константы ===
