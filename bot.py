@@ -10,14 +10,15 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 from dotenv import load_dotenv
-from aiogram.utils.markdown import escape_md
+# ИСПРАВЛЕНО: Правильный импорт для aiogram 3.x
+from aiogram.utils.text_decorations import escape_md
 
 # === Настройки ===
 sys.stdout.reconfigure(encoding='utf-8')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 load_dotenv()
 
-# === ИСПРАВЛЕНО: Конфигурация клиентов API ===
+# === Конфигурация клиентов API ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 openai_client = openai.AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 xai_client = XAI_Client(api_key=os.getenv("GROK_API_KEY"))
@@ -136,12 +137,9 @@ async def handle_image_generation(message: Message):
              error_message = e.body['message']
         await message.answer(f"❌ <b>Ошибка при генерации изображения.</b>\n\n<pre>{escape_md(error_message)}</pre>")
 
-# === ИСПРАВЛЕНО: ТОЧКА ВХОДА ===
+# --- ТОЧКА ВХОДА ---
 async def main():
-    if not BOT_TOKEN:
-        logging.error("Переменная BOT_TOKEN не найдена в окружении!")
-        return
-        
+    if not BOT_TOKEN: logging.error("Переменная BOT_TOKEN не найдена в окружении!"); return
     await bot.delete_webhook(drop_pending_updates=True)
     logging.info("🤖 Бот запущен")
     await bot.set_my_commands([types.BotCommand(command="start", description="Перезапустить бота"), types.BotCommand(command="reset", description="Перезапустить бота")])
