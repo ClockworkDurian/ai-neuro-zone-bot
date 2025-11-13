@@ -10,20 +10,20 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 from dotenv import load_dotenv
-from aiogram.utils.markdown import hbold, hitalic, hcode, hlink, hunderline, hstrikethrough, hspoiler, escape_md
+from aiogram.utils.markdown import escape_md
 
 # === Настройки ===
 sys.stdout.reconfigure(encoding='utf-8')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 load_dotenv()
 
-# === Конфигурация клиентов API ===
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN")
+# === ИСПРАВЛЕНО: Конфигурация клиентов API ===
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 openai_client = openai.AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 xai_client = XAI_Client(api_key=os.getenv("GROK_API_KEY"))
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
-bot = Bot(token=TELEGRAM_TOKEN, parse_mode="HTML") # ИЗМЕНЕНО: Используем HTML-парсер для большей надежности
+bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
 # === Состояние пользователей и константы ===
@@ -83,7 +83,6 @@ async def image_provider_selection(callback_query: types.CallbackQuery):
     elif provider == "grok": provider_name = "Grok Image (xAI)"
     await callback_query.message.edit_text(f"✅ Выбрана технология: <b>{provider_name}</b>.\n\nОтправьте промпт для генерации.")
 
-
 # --- ГЛАВНЫЙ ОБРАБОТЧИК ---
 @dp.message()
 async def main_message_handler(message: Message):
@@ -93,7 +92,6 @@ async def main_message_handler(message: Message):
     if mode == "textchat": await handle_text_chat(message)
     elif mode == "imagegen": await handle_image_generation(message)
     else: await message.answer("Неизвестный режим. Начните с /start")
-
 
 # --- Логика текстового чата (без синтаксических ошибок) ---
 async def handle_text_chat(message: Message):
@@ -115,7 +113,6 @@ async def handle_text_chat(message: Message):
         answer = f"❌ <b>Произошла ошибка.</b>\n\n<pre>{escape_md(str(e))}</pre>"
     user_state[user_id]["history"] = history; await message.answer(answer)
 
-
 # --- Логика генерации изображений (с исправленной обработкой ошибок) ---
 async def handle_image_generation(message: Message):
     user_id = message.from_user.id; provider = user_state[user_id].get("provider")
@@ -133,18 +130,18 @@ async def handle_image_generation(message: Message):
             duration = time.time() - start_time; logging.info(f"SUCCESS image generation for user_id: {user_id}. Provider: {provider}. Duration: {duration:.2f}s"); await message.answer_photo(photo=image_url, caption=caption)
         else: raise Exception("Provider logic is not implemented")
     except Exception as e:
-        duration = time.time() - start_time
-        logging.exception(f"ERROR during image generation for user_id: {user_id}. Provider: {provider}")
-        # ИСПРАВЛЕНО: Безопасное форматирование текста ошибки
+        duration = time.time() - start_time; logging.exception(f"ERROR during image generation for user_id: {user_id}. Provider: {provider}")
         error_message = str(e)
         if isinstance(e, openai.BadRequestError) and e.body and 'message' in e.body:
              error_message = e.body['message']
         await message.answer(f"❌ <b>Ошибка при генерации изображения.</b>\n\n<pre>{escape_md(error_message)}</pre>")
 
-
-# --- ТОЧКА ВХОДА ---
+# === ИСПРАВЛЕНО: ТОЧКА ВХОДА ===
 async def main():
-    if not TELEGRAM_TOKEN: logging.error("Токен бота не найден!"); return
+    if not BOT_TOKEN:
+        logging.error("Переменная BOT_TOKEN не найдена в окружении!")
+        return
+        
     await bot.delete_webhook(drop_pending_updates=True)
     logging.info("🤖 Бот запущен")
     await bot.set_my_commands([types.BotCommand(command="start", description="Перезапустить бота"), types.BotCommand(command="reset", description="Перезапустить бота")])
