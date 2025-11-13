@@ -5,13 +5,12 @@ import asyncio
 import time
 import openai
 import google.generativeai as genai
+import html  # ИСПРАВЛЕНО: Используем стандартную библиотеку html
 from xai_sdk import Client as XAI_Client
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 from dotenv import load_dotenv
-# ИСПРАВЛЕНО: Правильный импорт для aiogram 3.x
-from aiogram.utils.text_decorations import escape_md
 
 # === Настройки ===
 sys.stdout.reconfigure(encoding='utf-8')
@@ -94,7 +93,7 @@ async def main_message_handler(message: Message):
     elif mode == "imagegen": await handle_image_generation(message)
     else: await message.answer("Неизвестный режим. Начните с /start")
 
-# --- Логика текстового чата (без синтаксических ошибок) ---
+# --- Логика текстового чата ---
 async def handle_text_chat(message: Message):
     user_id = message.from_user.id; start_time = time.time(); provider = user_state[user_id]["provider"]; model_id = user_state[user_id]["model"]; user_input = message.text.strip(); history = user_state[user_id].get("history", []); answer = ""
     if not model_id: await message.answer("Сначала выберите модель."); return
@@ -111,10 +110,11 @@ async def handle_text_chat(message: Message):
         duration = time.time() - start_time; logging.info(f"SUCCESS text chat for user_id: {user_id}. Provider: {provider}, Model: {model_id}. Duration: {duration:.2f}s")
     except Exception as e:
         duration = time.time() - start_time; logging.exception(f"ERROR during text chat for user_id: {user_id}. Provider: {provider}. Error: {e}")
-        answer = f"❌ <b>Произошла ошибка.</b>\n\n<pre>{escape_md(str(e))}</pre>"
+        # ИСПРАВЛЕНО: Используем html.escape
+        answer = f"❌ <b>Произошла ошибка.</b>\n\n<pre>{html.escape(str(e))}</pre>"
     user_state[user_id]["history"] = history; await message.answer(answer)
 
-# --- Логика генерации изображений (с исправленной обработкой ошибок) ---
+# --- Логика генерации изображений ---
 async def handle_image_generation(message: Message):
     user_id = message.from_user.id; provider = user_state[user_id].get("provider")
     if not provider: await message.answer("Сначала выберите технологию."); return
@@ -135,7 +135,8 @@ async def handle_image_generation(message: Message):
         error_message = str(e)
         if isinstance(e, openai.BadRequestError) and e.body and 'message' in e.body:
              error_message = e.body['message']
-        await message.answer(f"❌ <b>Ошибка при генерации изображения.</b>\n\n<pre>{escape_md(error_message)}</pre>")
+        # ИСПРАВЛЕНО: Используем html.escape
+        await message.answer(f"❌ <b>Ошибка при генерации изображения.</b>\n\n<pre>{html.escape(error_message)}</pre>")
 
 # --- ТОЧКА ВХОДА ---
 async def main():
