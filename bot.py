@@ -7,6 +7,7 @@ import openai
 import google.generativeai as genai
 import html  # ИСПРАВЛЕНО: Используем стандартную библиотеку html
 from xai_sdk import Client as XAI_Client
+from xai_sdk.chat import user, assistant  # Добавлено для правильного формата сообщений Grok
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
@@ -124,9 +125,18 @@ async def handle_text_chat(message: Message):
         if provider == "openai":
             history.append({"role": "user", "content": user_input}); response = await openai_client.chat.completions.create(model=model_id, messages=history); answer = response.choices[0].message.content; history.append({"role": "assistant", "content": answer})
         elif provider == "grok":
-            history.append({"role": "USER", "content": user_input})
-            def _generate(): return xai_client.chat.create(model=model_id, messages=history).choices[0].message.content
-            answer = await asyncio.to_thread(_generate); history.append({"role": "ASSISTANT", "content": answer})
+            # Построение сообщений с использованием helper-функций
+            messages = []
+            for msg in history:
+                if msg["role"] == "user":
+                    messages.append(user(msg["content"]))
+                elif msg["role"] == "assistant":
+                    messages.append(assistant(msg["content"]))
+            chat = xai_client.chat.create(model=model_id, messages=messages)
+            chat.append(user(user_input))
+            def _generate(): return chat.sample()
+            response = await asyncio.to_thread(_generate); answer = response.content
+            history.append({"role": "user", "content": user_input}); history.append({"role": "assistant", "content": answer})
         elif provider == "gemini":
             gemini_sdk_history = [{"role": "user" if msg["role"] == "user" else "model", "parts": [msg["content"]]} for msg in history]; gemini_model = genai.GenerativeModel(model_id); chat_session = gemini_model.start_chat(history=gemini_sdk_history); response = await chat_session.send_message_async(user_input); answer = response.text; history.append({"role": "user", "content": user_input}); history.append({"role": "assistant", "content": answer})
         duration = time.time() - start_time; logging.info(f"SUCCESS text chat for user_id: {user_id}. Provider: {provider}, Model: {model_id}. Duration: {duration:.2f}s")
