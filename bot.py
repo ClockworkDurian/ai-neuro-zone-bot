@@ -49,18 +49,39 @@ def image_provider_menu():
 def reset_user_state(user_id):
     user_state[user_id] = {"provider": None, "model": None, "history": [], "mode": None}
 
-# === Обработчики команд и кнопок (без изменений) ===
+# === Новые меню для возврата ===
+def model_selected_menu():
+    buttons = [
+        [InlineKeyboardButton(text="⬅️ Назад к провайдерам", callback_data="back_to_provider")],
+        [InlineKeyboardButton(text="⬅️ Назад в главное меню", callback_data="back_to_main_menu")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def image_selected_menu():
+    buttons = [
+        [InlineKeyboardButton(text="⬅️ Назад в главное меню", callback_data="back_to_main_menu")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+# === Обработчики команд и кнопок ===
 @dp.message(Command("start", "reset"))
 async def start_reset_command(message: Message): reset_user_state(message.from_user.id); await message.answer("<b>👋 Привет! Это бот NeuroZone.</b>\n\nВыберите, что вы хотите сделать:", reply_markup=main_mode_menu())
 @dp.callback_query(lambda c: c.data == "back_to_main_menu")
-async def back_to_main_menu_handler(callback_query: types.CallbackQuery): reset_user_state(callback_query.from_user.id); await callback_query.message.edit_text("<b>👋 Привет! ...</b>", reply_markup=main_mode_menu())
+async def back_to_main_menu_handler(callback_query: types.CallbackQuery): reset_user_state(callback_query.from_user.id); await callback_query.message.edit_text("<b>👋 Привет! Это бот NeuroZone.</b>\n\nВыберите, что вы хотите сделать:", reply_markup=main_mode_menu())
+@dp.callback_query(lambda c: c.data == "back_to_provider")
+async def back_to_provider_handler(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    if user_id in user_state:
+        user_state[user_id]["model"] = None
+        # user_state[user_id]["history"] = []  # Опционально: сброс истории при возврате
+    await callback_query.message.edit_text("Выберите провайдера для текстового чата:", reply_markup=text_provider_menu())
 @dp.callback_query(lambda c: c.data.startswith("mode_"))
 async def mode_selection_handler(callback_query: types.CallbackQuery):
     mode = callback_query.data.split("_")[1]; user_id = callback_query.from_user.id;
     if user_id not in user_state: reset_user_state(user_id)
     user_state[user_id]["mode"] = mode
-    if mode == "textchat": await callback_query.message.edit_text("Выбран режим текстового чата...", reply_markup=text_provider_menu())
-    elif mode == "imagegen": await callback_query.message.edit_text("Выбран режим генерации изображений...", reply_markup=image_provider_menu())
+    if mode == "textchat": await callback_query.message.edit_text("Выберите провайдера для текстового чата:", reply_markup=text_provider_menu())
+    elif mode == "imagegen": await callback_query.message.edit_text("Выберите провайдера для генерации изображений:", reply_markup=image_provider_menu())
 @dp.callback_query(lambda c: c.data.startswith("provider_"))
 async def text_provider_selection(callback_query: types.CallbackQuery):
     provider = callback_query.data.split("_")[1]; user_id = callback_query.from_user.id; user_state[user_id]["provider"] = provider; models_dict, header = {}, ""
@@ -74,7 +95,7 @@ async def text_provider_selection(callback_query: types.CallbackQuery):
 async def model_selection(callback_query: types.CallbackQuery):
     model_id = callback_query.data.split("_", 1)[1]; user_id = callback_query.from_user.id;
     if user_id not in user_state or not user_state[user_id].get("provider"): await callback_query.answer("Ошибка. Начните с /start"); return
-    user_state[user_id]["model"] = model_id; await callback_query.message.edit_text(f"✅ Модель <b>{model_id}</b> выбрана.\n\nОтправьте свой вопрос.")
+    user_state[user_id]["model"] = model_id; await callback_query.message.edit_text(f"✅ Модель <b>{model_id}</b> выбрана.\n\nОтправьте свой вопрос.", reply_markup=model_selected_menu())
 @dp.callback_query(lambda c: c.data.startswith("image_provider_"))
 async def image_provider_selection(callback_query: types.CallbackQuery):
     provider = callback_query.data.split("_")[2]; user_id = callback_query.from_user.id
@@ -82,7 +103,7 @@ async def image_provider_selection(callback_query: types.CallbackQuery):
     user_state[user_id]["provider"] = provider; provider_name = ""
     if provider == "openai": provider_name = "DALL-E 3 (OpenAI)"
     elif provider == "grok": provider_name = "Grok Image (xAI)"
-    await callback_query.message.edit_text(f"✅ Выбрана технология: <b>{provider_name}</b>.\n\nОтправьте промпт для генерации.")
+    await callback_query.message.edit_text(f"✅ Выбрана технология: <b>{provider_name}</b>.\n\nОтправьте промпт для генерации.", reply_markup=image_selected_menu())
 
 # --- ГЛАВНЫЙ ОБРАБОТЧИК ---
 @dp.message()
@@ -103,9 +124,9 @@ async def handle_text_chat(message: Message):
         if provider == "openai":
             history.append({"role": "user", "content": user_input}); response = await openai_client.chat.completions.create(model=model_id, messages=history); answer = response.choices[0].message.content; history.append({"role": "assistant", "content": answer})
         elif provider == "grok":
-            history.append({"role": "user", "content": user_input})
+            history.append({"role": "USER", "content": user_input})
             def _generate(): return xai_client.chat.create(model=model_id, messages=history).choices[0].message.content
-            answer = await asyncio.to_thread(_generate); history.append({"role": "assistant", "content": answer})
+            answer = await asyncio.to_thread(_generate); history.append({"role": "ASSISTANT", "content": answer})
         elif provider == "gemini":
             gemini_sdk_history = [{"role": "user" if msg["role"] == "user" else "model", "parts": [msg["content"]]} for msg in history]; gemini_model = genai.GenerativeModel(model_id); chat_session = gemini_model.start_chat(history=gemini_sdk_history); response = await chat_session.send_message_async(user_input); answer = response.text; history.append({"role": "user", "content": user_input}); history.append({"role": "assistant", "content": answer})
         duration = time.time() - start_time; logging.info(f"SUCCESS text chat for user_id: {user_id}. Provider: {provider}, Model: {model_id}. Duration: {duration:.2f}s")
@@ -113,6 +134,8 @@ async def handle_text_chat(message: Message):
         duration = time.time() - start_time; logging.exception(f"ERROR during text chat for user_id: {user_id}. Provider: {provider}. Error: {e}")
         # ИСПРАВЛЕНО: Используем html.escape
         answer = f"❌ <b>Произошла ошибка.</b>\n\n<pre>{html.escape(str(e))}</pre>"
+    if len(history) > MAX_HISTORY_LENGTH * 2:  # Учитывая пары user-assistant
+        history = history[-MAX_HISTORY_LENGTH * 2:]
     user_state[user_id]["history"] = history; await message.answer(answer)
 
 # --- Логика генерации изображений ---
