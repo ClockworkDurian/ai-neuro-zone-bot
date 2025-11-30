@@ -1,184 +1,265 @@
-import os
-import sys
-import logging
+# bot.py (обновлённый)
 import asyncio
+import logging
+import os
 import time
-import openai
-import google.generativeai as genai
-import html  # ИСПРАВЛЕНО: Используем стандартную библиотеку html
-from xai_sdk import Client as XAI_Client
-from xai_sdk.chat import user, assistant  # Добавлено для правильного формата сообщений Grok
+from collections import defaultdict, deque
+from typing import Dict, List
+
 from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
-from aiogram.client.default import DefaultBotProperties
-from dotenv import load_dotenv
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.utils import exceptions, executor
 
-# === Настройки ===
-sys.stdout.reconfigure(encoding='utf-8')
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-load_dotenv()
+from llm_core import generate_text_stream, generate_text, generate_image, trim_history_by_tokens, estimate_tokens
 
-# === Конфигурация клиентов API ===
+# --- Настройка логирования (без логирования пользовательских запросов) ---
+logger = logging.getLogger("neurozone_bot")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(ch)
+
+# --- Переменные окружения (Railway) ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-openai_client = openai.AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-xai_client = XAI_Client(api_key=os.getenv("GROK_API_KEY"))
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GROK_API_KEY = os.getenv("GROK_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode='HTML'))
+if not BOT_TOKEN:
+    logger.error("BOT_TOKEN not set in envs. Exiting.")
+    raise SystemExit("BOT_TOKEN is required")
+
+# --- Параметры (можно поднимать/тюнить) ---
+MAX_HISTORY_TOKENS_DEFAULT = 3000
+RATE_LIMIT_PER_MINUTE = 30  # максимум запросов на пользователя в минуту
+STREAM_EDIT_INTERVAL = 0.35  # сек между редактированием сообщения при стриминге
+
+# --- Простая rate-limit реализация: sliding window timestamps per user ---
+user_requests: Dict[int, deque] = defaultdict(lambda: deque())
+
+def check_rate_limit(user_id: int, limit=RATE_LIMIT_PER_MINUTE) -> bool:
+    now = time.time()
+    window = 60
+    dq = user_requests[user_id]
+    while dq and dq[0] < now - window:
+        dq.popleft()
+    if len(dq) >= limit:
+        return False
+    dq.append(now)
+    return True
+
+# --- Состояния пользователей (в памяти) ---
+user_state: Dict[int, Dict] = defaultdict(lambda: {
+    "mode": "text",  # or "image"
+    "provider": "openai",  # "openai" / "grok" / "gemini"
+    "model": None,
+    "history": [],  # list of {"role":"user"/"assistant", "content": "..."}
+    "max_history_tokens": MAX_HISTORY_TOKENS_DEFAULT
+})
+
+# --- Клавиатуры (статичные версии) ---
+def kb_main() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton("Текст", callback_data="mode:text"),
+         InlineKeyboardButton("Картинки", callback_data="mode:image")],
+        [InlineKeyboardButton("Провайдер: OpenAI", callback_data="provider:openai"),
+         InlineKeyboardButton("Grok", callback_data="provider:grok"),
+         InlineKeyboardButton("Gemini", callback_data="provider:gemini")],
+        [InlineKeyboardButton("Сброс истории", callback_data="action:reset")]
+    ])
+
+def kb_models(provider: str) -> InlineKeyboardMarkup:
+    buttons = []
+    if provider == "openai":
+        buttons = [
+            InlineKeyboardButton("gpt-4o-mini", callback_data="model:gpt-4o-mini"),
+            InlineKeyboardButton("gpt-4o", callback_data="model:gpt-4o")
+        ]
+    elif provider == "grok":
+        buttons = [
+            InlineKeyboardButton("grok-2-mini", callback_data="model:grok-2-mini"),
+            InlineKeyboardButton("grok-2", callback_data="model:grok-2")
+        ]
+    elif provider == "gemini":
+        buttons = [
+            InlineKeyboardButton("gemini-1.5-flash", callback_data="model:gemini-1.5-flash")
+        ]
+    kb = InlineKeyboardMarkup()
+    kb.row(*buttons)
+    return kb
+
+# --- Инициализация бота / dispatcher ---
+bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
-# === Состояние пользователей и константы ===
-user_state = {}
-MAX_HISTORY_LENGTH = 10
+# --- HELPERS ---
+def safe_log_event(user_id: int, event: str, extra: dict = None):
+    """Логируем событие, НО НЕ хранит и не выводит пользовательский текст."""
+    msg = {"user_id": user_id, "event": event}
+    if extra:
+        msg.update(extra)
+    logger.info("EVENT %s", msg)
 
-# === Модели (без изменений) ===
-openai_models = { "GPT-5": {"id": "gpt-5", "desc": "Лучшая модель для кода и агентных задач."}, "GPT-5 mini": {"id": "gpt-5-mini", "desc": "Более быстрая, экономичная версия."}, "GPT-5 nano": {"id": "gpt-5-nano", "desc": "Самая быстрая и экономичная версия."}, "GPT-4.1": {"id": "gpt-4.1", "desc": "Самая умная модель без рассуждений."}}
-grok_models = {"Grok-code-fast-1": {"id": "grok-code-fast-1", "desc": "Быстрая и экономичная модель для кодирования."}, "Grok-4-fast-reasoning": {"id": "grok-4-fast-reasoning", "desc": "Последнее достижение в экономичных моделях."}, "Grok-4-fast-non-reasoning": {"id": "grok-4-fast-non-reasoning", "desc": "Последнее достижение в экономичных моделях."}}
-gemini_models = {"Gemini 2.5 Flash": {"id": "gemini-2.5-flash", "desc": "Лучшая по цене/производительности."}, "Gemini 2.5 Flash-Lite": {"id": "gemini-2.5-flash-lite", "desc": "Самая быстрая flash-модель."}}
+# Ограничение истории по токенам (используем функцию trim_history_by_tokens)
+def trim_user_history(user_id: int):
+    st = user_state[user_id]
+    hist = st["history"]
+    st["history"] = trim_history_by_tokens(hist, st.get("max_history_tokens", MAX_HISTORY_TOKENS_DEFAULT))
 
-# === Меню (без изменений) ===
-def main_mode_menu():
-    buttons = [[InlineKeyboardButton(text="✍️ Текстовый чат", callback_data="mode_textchat")], [InlineKeyboardButton(text="🎨 Сгенерировать изображение", callback_data="mode_imagegen")], [InlineKeyboardButton(text="🌐 Сайт", url="https://neurozone.pro/")], [InlineKeyboardButton(text="🔒 Политика конфиденциальности", url="https://neurozone.pro/privacy")]]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-def text_provider_menu():
-    buttons = [[InlineKeyboardButton(text="💭 ChatGPT (OpenAI)", callback_data="provider_openai")], [InlineKeyboardButton(text="🧠 Grok (xAI)", callback_data="provider_grok")], [InlineKeyboardButton(text="⚡ Gemini (Google)", callback_data="provider_gemini")], [InlineKeyboardButton(text="⬅️ Назад в главное меню", callback_data="back_to_main_menu")]]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-def image_provider_menu():
-    buttons = [[InlineKeyboardButton(text=" DALL-E 3 (OpenAI)", callback_data="image_provider_openai")], [InlineKeyboardButton(text=" Grok Image (xAI)", callback_data="image_provider_grok")], [InlineKeyboardButton(text="⬅️ Назад в главное меню", callback_data="back_to_main_menu")]]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-def reset_user_state(user_id):
-    user_state[user_id] = {"provider": None, "model": None, "history": [], "mode": None}
+# --- Handlers ---
 
-# === Новые меню для возврата ===
-def model_selected_menu():
-    buttons = [
-        [InlineKeyboardButton(text="⬅️ Назад к провайдерам", callback_data="back_to_provider")],
-        [InlineKeyboardButton(text="⬅️ Назад в главное меню", callback_data="back_to_main_menu")]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-def image_selected_menu():
-    buttons = [
-        [InlineKeyboardButton(text="⬅️ Назад в главное меню", callback_data="back_to_main_menu")]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-# === Обработчики команд и кнопок ===
-@dp.message(Command("start", "reset"))
-async def start_reset_command(message: Message): reset_user_state(message.from_user.id); await message.answer("<b>👋 Привет! Это бот NeuroZone.</b>\n\nВыберите, что вы хотите сделать:", reply_markup=main_mode_menu())
-@dp.callback_query(lambda c: c.data == "back_to_main_menu")
-async def back_to_main_menu_handler(callback_query: types.CallbackQuery): reset_user_state(callback_query.from_user.id); await callback_query.message.edit_text("<b>👋 Привет! Это бот NeuroZone.</b>\n\nВыберите, что вы хотите сделать:", reply_markup=main_mode_menu())
-@dp.callback_query(lambda c: c.data == "back_to_provider")
-async def back_to_provider_handler(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    if user_id in user_state:
-        user_state[user_id]["model"] = None
-        # user_state[user_id]["history"] = []  # Опционально: сброс истории при возврате
-    await callback_query.message.edit_text("Выберите провайдера для текстового чата:", reply_markup=text_provider_menu())
-@dp.callback_query(lambda c: c.data.startswith("mode_"))
-async def mode_selection_handler(callback_query: types.CallbackQuery):
-    mode = callback_query.data.split("_")[1]; user_id = callback_query.from_user.id;
-    if user_id not in user_state: reset_user_state(user_id)
-    user_state[user_id]["mode"] = mode
-    if mode == "textchat": await callback_query.message.edit_text("Выберите провайдера для текстового чата:", reply_markup=text_provider_menu())
-    elif mode == "imagegen": await callback_query.message.edit_text("Выберите провайдера для генерации изображений:", reply_markup=image_provider_menu())
-@dp.callback_query(lambda c: c.data.startswith("provider_"))
-async def text_provider_selection(callback_query: types.CallbackQuery):
-    provider = callback_query.data.split("_")[1]; user_id = callback_query.from_user.id; user_state[user_id]["provider"] = provider; models_dict, header = {}, ""
-    if provider == "openai": models_dict, header = openai_models, "🔹 <b>ChatGPT (OpenAI)</b>"
-    elif provider == "grok": models_dict, header = grok_models, "🧠 <b>Grok (xAI)</b>"
-    elif provider == "gemini": models_dict, header = gemini_models, "⚡ <b>Gemini (Google)</b>"
-    text_parts = [f"{header}\n\nВыберите модель:"]; buttons = []
-    for name, data in models_dict.items(): text_parts.append(f"\n<b>{name}</b> - <i>{data['desc']}</i>"); buttons.append([InlineKeyboardButton(text=name, callback_data=f"model_{data['id']}")])
-    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="mode_textchat")]); await callback_query.message.edit_text("\n".join(text_parts), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-@dp.callback_query(lambda c: c.data.startswith("model_"))
-async def model_selection(callback_query: types.CallbackQuery):
-    model_id = callback_query.data.split("_", 1)[1]; user_id = callback_query.from_user.id;
-    if user_id not in user_state or not user_state[user_id].get("provider"): await callback_query.answer("Ошибка. Начните с /start"); return
-    user_state[user_id]["model"] = model_id; await callback_query.message.edit_text(f"✅ Модель <b>{model_id}</b> выбрана.\n\nОтправьте свой вопрос.", reply_markup=model_selected_menu())
-@dp.callback_query(lambda c: c.data.startswith("image_provider_"))
-async def image_provider_selection(callback_query: types.CallbackQuery):
-    provider = callback_query.data.split("_")[2]; user_id = callback_query.from_user.id
-    if user_id not in user_state: reset_user_state(user_id)
-    user_state[user_id]["provider"] = provider; provider_name = ""
-    if provider == "openai": provider_name = "DALL-E 3 (OpenAI)"
-    elif provider == "grok": provider_name = "Grok Image (xAI)"
-    await callback_query.message.edit_text(f"✅ Выбрана технология: <b>{provider_name}</b>.\n\nОтправьте промпт для генерации.", reply_markup=image_selected_menu())
-
-# --- ГЛАВНЫЙ ОБРАБОТЧИК ---
-@dp.message()
-async def main_message_handler(message: Message):
+@dp.message(commands=["start", "help"])
+async def cmd_start(message: types.Message):
     user_id = message.from_user.id
-    if user_id not in user_state or not user_state[user_id].get("mode"): await message.answer("Пожалуйста, выберите режим работы через /start"); return
-    mode = user_state[user_id]["mode"]
-    if mode == "textchat": await handle_text_chat(message)
-    elif mode == "imagegen": await handle_image_generation(message)
-    else: await message.answer("Неизвестный режим. Начните с /start")
+    safe_log_event(user_id, "start")
+    await message.answer("Привет! Выбери режим и провайдера в меню.", reply_markup=kb_main())
 
-# --- Логика текстового чата ---
-async def handle_text_chat(message: Message):
-    user_id = message.from_user.id; start_time = time.time(); provider = user_state[user_id]["provider"]; model_id = user_state[user_id]["model"]; user_input = message.text.strip(); history = user_state[user_id].get("history", []); answer = ""
-    if not model_id: await message.answer("Сначала выберите модель."); return
-    logging.info(f"Received text message from user_id: {user_id}"); await message.chat.do("typing")
+@dp.callback_query()
+async def cb_handler(q: types.CallbackQuery):
+    user_id = q.from_user.id
+    data = q.data or ""
+    safe_log_event(user_id, "callback", {"data": data})
+    if data.startswith("mode:"):
+        mode = data.split(":",1)[1]
+        user_state[user_id]["mode"] = mode
+        await q.message.edit_text(f"Режим: {mode}. Выберите провайдера и модель.", reply_markup=kb_models(user_state[user_id].get("provider","openai")))
+        await q.answer()
+        return
+    if data.startswith("provider:"):
+        prov = data.split(":",1)[1]
+        user_state[user_id]["provider"] = prov
+        await q.message.edit_text(f"Провайдер: {prov}. Выберите модель.", reply_markup=kb_models(prov))
+        await q.answer()
+        return
+    if data.startswith("model:"):
+        model = data.split(":",1)[1]
+        user_state[user_id]["model"] = model
+        await q.message.edit_text(f"Модель установлена: {model}\nТеперь просто отправь сообщение с запросом.", reply_markup=kb_main())
+        await q.answer()
+        return
+    if data == "action:reset":
+        user_state[user_id]["history"] = []
+        await q.answer("История сброшена.")
+        await q.message.edit_text("История очищена.", reply_markup=kb_main())
+        safe_log_event(user_id, "history_reset")
+        return
+    await q.answer()
+
+@dp.message()
+async def on_message(message: types.Message):
+    user_id = message.from_user.id
+    text = message.text or ""
+    safe_log_event(user_id, "message_received", {"len": len(text)})
+    # rate limit
+    if not check_rate_limit(user_id):
+        await message.answer("Слишком много запросов — подожди минуту.")
+        safe_log_event(user_id, "rate_limited")
+        return
+
+    state = user_state[user_id]
+    mode = state.get("mode", "text")
+    provider = state.get("provider", "openai")
+    model = state.get("model")
+    if mode == "image":
+        # генерация изображения
+        # логируем событие (без prompt)
+        safe_log_event(user_id, "image_request", {"provider": provider, "model": model})
+        try:
+            # короткая заглушка - вызов llm_core
+            img_url = await generate_image(provider=provider, prompt=text,
+                                           openai_key=OPENAI_API_KEY, grok_key=GROK_API_KEY)
+            await message.answer_photo(img_url, caption="Готово (сгенерировано).")
+            # записать в историю (не сохраняем сам prompt в лог)
+            state["history"].append({"role": "user", "content": "[image-prompt]"})
+            state["history"].append({"role": "assistant", "content": "[image-generated]"})
+            trim_user_history(user_id)
+            safe_log_event(user_id, "image_ok", {"provider": provider})
+        except Exception as e:
+            safe_log_event(user_id, "image_error", {"err": str(e)})
+            await message.answer("Ошибка при генерации изображения. Повторите позже.")
+        return
+
+    # text mode
+    # append user message to history (we store the content for actual requests, but logs don't print it)
+    state["history"].append({"role": "user", "content": text})
+    trim_user_history(user_id)
+
+    # streaming: сначала отправляем "печатает..." и потом редактируем
+    status_msg = await message.answer("Генерирую ответ...")
     try:
-        if provider == "openai":
-            history.append({"role": "user", "content": user_input}); response = await openai_client.chat.completions.create(model=model_id, messages=history); answer = response.choices[0].message.content; history.append({"role": "assistant", "content": answer})
-        elif provider == "grok":
-            # Построение сообщений с использованием helper-функций
-            messages = []
-            for msg in history:
-                if msg["role"] == "user":
-                    messages.append(user(msg["content"]))
-                elif msg["role"] == "assistant":
-                    messages.append(assistant(msg["content"]))
-            chat = xai_client.chat.create(model=model_id, messages=messages)
-            chat.append(user(user_input))
-            def _generate(): return chat.sample()
-            response = await asyncio.to_thread(_generate); answer = response.content
-            history.append({"role": "user", "content": user_input}); history.append({"role": "assistant", "content": answer})
-        elif provider == "gemini":
-            gemini_sdk_history = [{"role": "user" if msg["role"] == "user" else "model", "parts": [msg["content"]]} for msg in history]; gemini_model = genai.GenerativeModel(model_id); chat_session = gemini_model.start_chat(history=gemini_sdk_history); response = await chat_session.send_message_async(user_input); answer = response.text; history.append({"role": "user", "content": user_input}); history.append({"role": "assistant", "content": answer})
-        duration = time.time() - start_time; logging.info(f"SUCCESS text chat for user_id: {user_id}. Provider: {provider}, Model: {model_id}. Duration: {duration:.2f}s")
-    except Exception as e:
-        duration = time.time() - start_time; logging.exception(f"ERROR during text chat for user_id: {user_id}. Provider: {provider}. Error: {e}")
-        # ИСПРАВЛЕНО: Используем html.escape
-        answer = f"❌ <b>Произошла ошибка.</b>\n\n<pre>{html.escape(str(e))}</pre>"
-    if len(history) > MAX_HISTORY_LENGTH * 2:  # Учитывая пары user-assistant
-        history = history[-MAX_HISTORY_LENGTH * 2:]
-    user_state[user_id]["history"] = history; await message.answer(answer)
+        # Try streaming if supported
+        stream_gen = generate_text_stream(provider=provider,
+                                          model=model or ("gpt-4o-mini" if provider=="openai" else "grok-2-mini"),
+                                          history=state["history"],
+                                          user_input=text,
+                                          openai_key=OPENAI_API_KEY,
+                                          grok_key=GROK_API_KEY,
+                                          gemini_key=GEMINI_API_KEY,
+                                          max_history_tokens=state.get("max_history_tokens", MAX_HISTORY_TOKENS_DEFAULT))
+        # accumulate small chunks for edit
+        full = ""
+        last_edit_time = time.time()
+        async for chunk in stream_gen:
+            # chunk is str
+            full += chunk
+            # редактируем сообщение каждые STREAM_EDIT_INTERVAL
+            if time.time() - last_edit_time >= STREAM_EDIT_INTERVAL:
+                try:
+                    await status_msg.edit_text(full)
+                except exceptions.TelegramAPIError:
+                    pass
+                last_edit_time = time.time()
+        # final edit
+        try:
+            await status_msg.edit_text(full)
+        except exceptions.TelegramAPIError:
+            pass
 
-# --- Логика генерации изображений ---
-async def handle_image_generation(message: Message):
-    user_id = message.from_user.id; provider = user_state[user_id].get("provider")
-    if not provider: await message.answer("Сначала выберите технологию."); return
-    prompt = message.text.strip(); logging.info(f"User {user_id} requested an image with provider '{provider}'."); await message.answer("🎨 Создаю изображение..."); await message.chat.do("upload_photo")
-    start_time = time.time()
-    try:
-        image_url, caption = "", ""
-        if provider == "openai":
-            response = await openai_client.images.generate(model="dall-e-3", prompt=prompt, n=1, size="1024x1024"); image_url = response.data[0].url; caption = f"Изображение от DALL-E 3:\n«{prompt}»"
-        elif provider == "grok":
-            def _generate(): return xai_client.image.sample(model="grok-2-image-1212", prompt=prompt, image_format="url").url
-            image_url = await asyncio.to_thread(_generate); caption = f"Изображение от Grok Image:\n«{prompt}»"
-        if image_url:
-            duration = time.time() - start_time; logging.info(f"SUCCESS image generation for user_id: {user_id}. Provider: {provider}. Duration: {duration:.2f}s"); await message.answer_photo(photo=image_url, caption=caption)
-        else: raise Exception("Provider logic is not implemented")
+        # добавляем ассистента в историю (сохраняем текст, но не логируем)
+        state["history"].append({"role": "assistant", "content": full})
+        trim_user_history(user_id)
+        safe_log_event(user_id, "text_ok", {"provider": provider, "model": model, "out_len": len(full)})
     except Exception as e:
-        duration = time.time() - start_time; logging.exception(f"ERROR during image generation for user_id: {user_id}. Provider: {provider}")
-        error_message = str(e)
-        if isinstance(e, openai.BadRequestError) and e.body and 'message' in e.body:
-             error_message = e.body['message']
-        # ИСПРАВЛЕНО: Используем html.escape
-        await message.answer(f"❌ <b>Ошибка при генерации изображения.</b>\n\n<pre>{html.escape(error_message)}</pre>")
+        safe_log_event(user_id, "text_error", {"provider": provider, "err": str(e)})
+        # fallback: пробуем non-stream генерацию (retry handled inside)
+        try:
+            resp = await generate_text(provider=provider,
+                                       model=model or ("gpt-4o-mini" if provider=="openai" else "grok-2-mini"),
+                                       history=state["history"],
+                                       user_input=text,
+                                       openai_key=OPENAI_API_KEY,
+                                       grok_key=GROK_API_KEY,
+                                       gemini_key=GEMINI_API_KEY,
+                                       max_history_tokens=state.get("max_history_tokens", MAX_HISTORY_TOKENS_DEFAULT))
+            await status_msg.edit_text(resp)
+            state["history"].append({"role": "assistant", "content": resp})
+            trim_user_history(user_id)
+            safe_log_event(user_id, "text_ok_fallback", {"provider": provider})
+        except Exception as e2:
+            logger.exception("Final fallback error: %s", e2)
+            await status_msg.edit_text("Не удалось получить ответ. Попробуйте позже.")
 
-# --- ТОЧКА ВХОДА ---
-async def main():
-    if not BOT_TOKEN: logging.error("Переменная BOT_TOKEN не найдена в окружении!"); return
-    await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("🤖 Бот запущен")
-    await bot.set_my_commands([types.BotCommand(command="start", description="Перезапустить бота"), types.BotCommand(command="reset", description="Перезапустить бота")])
-    await dp.start_polling(bot)
+# --- Command to set max_history_tokens by user (for testing/tariffs) ---
+@dp.message(commands=["set_history_tokens"])
+async def cmd_set_history(message: types.Message):
+    user_id = message.from_user.id
+    args = (message.get_args() or "").strip()
+    if not args.isdigit():
+        await message.answer("Использование: /set_history_tokens 3000")
+        return
+    v = int(args)
+    user_state[user_id]["max_history_tokens"] = v
+    await message.answer(f"Лимит истории в токенах установлен: {v}")
+    safe_log_event(user_id, "set_history", {"tokens": v})
+
+# graceful shutdown handler not required for Railway but useful locally
+async def on_startup(dp):
+    logger.info("Bot started")
+
+async def on_shutdown(dp):
+    logger.info("Bot shutting down")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # запускаем long-polling (Railway обычно запускает python bot.py)
+    executor.start_polling(dp, on_startup=on_startup, on_shutdown=on_shutdown)
