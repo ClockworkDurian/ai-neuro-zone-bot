@@ -1,4 +1,5 @@
-# bot.py — aiogram 3.x совместимая версия
+# bot.py — финальная версия, совместимая с aiogram 3.13.1
+
 import asyncio
 import logging
 import os
@@ -11,7 +12,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-# наша логика ИИ
+# Импорт из нашего модуля логики
 from llm_core import (
     generate_text_stream,
     generate_text,
@@ -20,13 +21,14 @@ from llm_core import (
 )
 
 # -------------------------------------------------------------------
-# ЛОГИРОВАНИЕ
+# ЛОГИРОВАНИЕ (без текста пользователей)
 # -------------------------------------------------------------------
 logger = logging.getLogger("neurozone_bot")
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
 handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
 logger.addHandler(handler)
+
 
 def safe_log(user_id, event, extra=None):
     """Логирование без текста пользователя."""
@@ -45,11 +47,11 @@ GROK_API_KEY = os.getenv("GROK_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not BOT_TOKEN:
-    raise SystemExit("❌ BOT_TOKEN не найден в переменных окружения")
+    raise SystemExit("❌ BOT_TOKEN отсутствует в переменных окружения")
 
 
 # -------------------------------------------------------------------
-# БОТ / ДИСПЕТЧЕР (aiogram 3.x)
+# ИНИЦИАЛИЗАЦИЯ aiogram 3.x
 # -------------------------------------------------------------------
 bot = Bot(
     token=BOT_TOKEN,
@@ -64,14 +66,14 @@ dp = Dispatcher()
 RATE_LIMIT_PER_MINUTE = 30
 user_requests = defaultdict(lambda: deque())
 
+
 def check_rate_limit(user_id: int) -> bool:
-    """Простой sliding window rate-limit."""
+    """Ограничение количества запросов в минуту."""
     now = time.time()
-    window = 60
     dq = user_requests[user_id]
 
-    # удалить старые запросы
-    while dq and dq[0] < now - window:
+    # удаляем запросы старше 60 сек
+    while dq and dq[0] < now - 60:
         dq.popleft()
 
     if len(dq) >= RATE_LIMIT_PER_MINUTE:
@@ -82,34 +84,35 @@ def check_rate_limit(user_id: int) -> bool:
 
 
 # -------------------------------------------------------------------
-# СОСТОЯНИЕ ПОЛЬЗОВАТЕЛЯ
+# СОСТОЯНИЕ ПОЛЬЗОВАТЕЛЕЙ
 # -------------------------------------------------------------------
 MAX_HISTORY_TOKENS_DEFAULT = 3000
 
 user_state = defaultdict(lambda: {
-    "mode": "text",         # text / image
-    "provider": "openai",   # openai / grok / gemini
-    "model": None,          # конкретная модель
-    "history": [],          # [{"role": "...", "content": "..."}]
+    "mode": "text",                # "text" или "image"
+    "provider": "openai",          # openai / grok / gemini
+    "model": None,                 # выбранная модель
+    "history": [],                 # список словарей с контекстом
     "max_history_tokens": MAX_HISTORY_TOKENS_DEFAULT
 })
 
-def trim_user_history(user_id: int):
-    st = user_state[user_id]
+
+def trim_user_history(uid: int):
+    st = user_state[uid]
     st["history"] = trim_history_by_tokens(
         st["history"],
-        st.get("max_history_tokens", MAX_HISTORY_TOKENS_DEFAULT)
+        st["max_history_tokens"]
     )
 
 
 # -------------------------------------------------------------------
-# INLINE-КНОПКИ
+# КЛАВИАТУРЫ — полностью переписаны под aiogram 3.x
 # -------------------------------------------------------------------
-def kb_main():
+def kb_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="Текст", callback_data="mode:text"),
-            InlineKeyboardButton(text="Картинки", callback_data="mode:image"),
+            InlineKeyboardButton(text="Картинки", callback_data="mode:image")
         ],
         [
             InlineKeyboardButton(text="OpenAI", callback_data="provider:openai"),
@@ -121,24 +124,24 @@ def kb_main():
         ]
     ])
 
-def kb_models(provider: str):
+
+def kb_models(provider: str) -> InlineKeyboardMarkup:
     if provider == "openai":
         buttons = [
-            InlineKeyboardButton("gpt-4o-mini", callback_data="model:gpt-4o-mini"),
-            InlineKeyboardButton("gpt-4o", callback_data="model:gpt-4o")
+            InlineKeyboardButton(text="gpt-4o-mini", callback_data="model:gpt-4o-mini"),
+            InlineKeyboardButton(text="gpt-4o", callback_data="model:gpt-4o"),
         ]
     elif provider == "grok":
         buttons = [
-            InlineKeyboardButton("grok-2-mini", callback_data="model:grok-2-mini"),
-            InlineKeyboardButton("grok-2", callback_data="model:grok-2")
+            InlineKeyboardButton(text="grok-2-mini", callback_data="model:grok-2-mini"),
+            InlineKeyboardButton(text="grok-2", callback_data="model:grok-2"),
         ]
     else:  # gemini
         buttons = [
-            InlineKeyboardButton("gemini-1.5-flash", callback_data="model:gemini-1.5-flash")
+            InlineKeyboardButton(text="gemini-1.5-flash", callback_data="model:gemini-1.5-flash")
         ]
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[buttons])
-    return kb
+    return InlineKeyboardMarkup(inline_keyboard=[buttons])
 
 
 # -------------------------------------------------------------------
@@ -146,14 +149,17 @@ def kb_models(provider: str):
 # -------------------------------------------------------------------
 
 @dp.message(Command("start", "help"))
-async def on_start(message: types.Message):
+async def cmd_start(message: types.Message):
     uid = message.from_user.id
     safe_log(uid, "start")
-    await message.answer("Привет! Выбери режим работы и провайдера:", reply_markup=kb_main())
+    await message.answer(
+        "Привет! Выбери режим работы и провайдера:",
+        reply_markup=kb_main()
+    )
 
 
 @dp.callback_query()
-async def on_callback(cb: types.CallbackQuery):
+async def cb_handler(cb: types.CallbackQuery):
     uid = cb.from_user.id
     data = cb.data or ""
     safe_log(uid, "callback", {"data": data})
@@ -162,9 +168,8 @@ async def on_callback(cb: types.CallbackQuery):
     if data.startswith("mode:"):
         mode = data.split(":", 1)[1]
         user_state[uid]["mode"] = mode
-
         await cb.message.edit_text(
-            f"Режим: {mode}\nТеперь выбери провайдера:",
+            f"Режим установлен: {mode}\nТеперь выбери провайдера:",
             reply_markup=kb_main()
         )
         await cb.answer()
@@ -172,12 +177,11 @@ async def on_callback(cb: types.CallbackQuery):
 
     # провайдер
     if data.startswith("provider:"):
-        prov = data.split(":", 1)[1]
-        user_state[uid]["provider"] = prov
-
+        provider = data.split(":", 1)[1]
+        user_state[uid]["provider"] = provider
         await cb.message.edit_text(
-            f"Провайдер: {prov}\nВыбери модель:",
-            reply_markup=kb_models(prov)
+            f"Провайдер: {provider}\nВыберите модель:",
+            reply_markup=kb_models(provider)
         )
         await cb.answer()
         return
@@ -186,9 +190,8 @@ async def on_callback(cb: types.CallbackQuery):
     if data.startswith("model:"):
         model = data.split(":", 1)[1]
         user_state[uid]["model"] = model
-
         await cb.message.edit_text(
-            f"Модель установлена: {model}\nТеперь отправь свой запрос.",
+            f"Модель установлена: {model}\nТеперь отправь запрос.",
             reply_markup=kb_main()
         )
         await cb.answer()
@@ -197,14 +200,20 @@ async def on_callback(cb: types.CallbackQuery):
     # сброс истории
     if data == "reset:history":
         user_state[uid]["history"] = []
-        await cb.message.edit_text("История очищена.", reply_markup=kb_main())
         safe_log(uid, "history_reset")
+        await cb.message.edit_text(
+            "История очищена.",
+            reply_markup=kb_main()
+        )
         await cb.answer()
         return
 
     await cb.answer()
 
 
+# -------------------------------------------------------------------
+# MESSAGE HANDLER (основной)
+# -------------------------------------------------------------------
 @dp.message()
 async def on_message(message: types.Message):
     uid = message.from_user.id
@@ -214,7 +223,7 @@ async def on_message(message: types.Message):
 
     # RATE LIMIT
     if not check_rate_limit(uid):
-        await message.answer("Слишком много запросов. Подожди минуту.")
+        await message.answer("Слишком много запросов, подожди минуту.")
         safe_log(uid, "rate_limited")
         return
 
@@ -223,11 +232,11 @@ async def on_message(message: types.Message):
     provider = st["provider"]
     model = st["model"]
 
-    # ----------------------------------------------------------
+    # ---------------------------------------------------------------
     # IMAGE MODE
-    # ----------------------------------------------------------
+    # ---------------------------------------------------------------
     if mode == "image":
-        safe_log(uid, "image_request", {"provider": provider, "model": model})
+        safe_log(uid, "image_request", {"provider": provider})
 
         try:
             img_url = await generate_image(
@@ -237,28 +246,30 @@ async def on_message(message: types.Message):
                 grok_key=GROK_API_KEY
             )
 
-            await message.answer_photo(img_url, caption="Сгенерировано!")
+            await message.answer_photo(img_url, caption="Готово!")
+
             st["history"].append({"role": "user", "content": "[image_prompt]"})
             st["history"].append({"role": "assistant", "content": "[image_generated]"})
             trim_user_history(uid)
-            safe_log(uid, "image_ok", {"provider": provider})
 
         except Exception as e:
-            safe_log(uid, "image_error", {"error": str(e)})
-            await message.answer("Ошибка генерации изображения. Попробуйте позже.")
-
+            safe_log(uid, "image_error", {"err": str(e)})
+            await message.answer("Ошибка генерации изображения.")
         return
 
-    # ----------------------------------------------------------
+    # ---------------------------------------------------------------
     # TEXT MODE + STREAMING
-    # ----------------------------------------------------------
-    # Добавить сообщение пользователя в историю
+    # ---------------------------------------------------------------
     st["history"].append({"role": "user", "content": text})
     trim_user_history(uid)
 
     status = await message.answer("Генерирую ответ...")
 
     try:
+        # streaming
+        full = ""
+        last_edit = time.time()
+
         stream = generate_text_stream(
             provider=provider,
             model=model or ("gpt-4o-mini" if provider == "openai" else "grok-2-mini"),
@@ -270,35 +281,30 @@ async def on_message(message: types.Message):
             max_history_tokens=st["max_history_tokens"]
         )
 
-        full_text = ""
-        last_edit = time.time()
-
-        # STREAM LOOP
         async for chunk in stream:
-            full_text += chunk
+            full += chunk
             if time.time() - last_edit >= 0.35:
                 try:
-                    await status.edit_text(full_text)
+                    await status.edit_text(full)
                 except TelegramAPIError:
                     pass
                 last_edit = time.time()
 
-        # финальное редактирование
+        # финальное обновление
         try:
-            await status.edit_text(full_text)
+            await status.edit_text(full)
         except TelegramAPIError:
             pass
 
-        st["history"].append({"role": "assistant", "content": full_text})
+        st["history"].append({"role": "assistant", "content": full})
         trim_user_history(uid)
-        safe_log(uid, "text_ok", {"provider": provider})
+        safe_log(uid, "text_ok")
 
     except Exception as e:
         safe_log(uid, "text_stream_error", {"err": str(e)})
 
-        # fallback — NON-STREAM RESPONSE
         try:
-            resp = await generate_text(
+            fallback = await generate_text(
                 provider=provider,
                 model=model or ("gpt-4o-mini" if provider == "openai" else "grok-2-mini"),
                 history=st["history"],
@@ -308,21 +314,15 @@ async def on_message(message: types.Message):
                 gemini_key=GEMINI_API_KEY,
                 max_history_tokens=st["max_history_tokens"]
             )
-
-            await status.edit_text(resp)
-            st["history"].append({"role": "assistant", "content": resp})
+            await status.edit_text(fallback)
+            st["history"].append({"role": "assistant", "content": fallback})
             trim_user_history(uid)
-            safe_log(uid, "text_fallback_ok", {"provider": provider})
-
-        except Exception as e2:
-            safe_log(uid, "text_fallback_error", {"err": str(e2)})
-            await status.edit_text(
-                "Ошибка. Провайдер перегружен или недоступен. Попробуйте позже."
-            )
+        except Exception:
+            await status.edit_text("Ошибка. Попробуйте позже.")
 
 
 # -------------------------------------------------------------------
-# START POLLING (aiogram 3.x)
+# RUN POLLING
 # -------------------------------------------------------------------
 async def main():
     logger.info("Bot started")
