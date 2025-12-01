@@ -1,237 +1,218 @@
-# llm_core.py
+"""
+llm_core.py
+Унифицированный слой для работы с OpenAI (ChatGPT), xAI Grok и Google Gemini.
+Функции:
+- generate_text_stream(...) -> async generator (chunks)
+- generate_text(...) -> final text (async)
+- generate_image(...) -> returns image_url (async)
+- trim_history_by_tokens(...) -> helper для обрезки истории (псевдо-токены)
+Примечание: реализована максимально совместимая логика с теми SDK,
+которые использовались в старом bot.py (xai_sdk, openai.AsyncOpenAI, google.generativeai).
+"""
+
 import asyncio
 import logging
-import math
-import random
-from typing import AsyncIterator, Dict, List, Tuple
+import time
+from typing import AsyncIterator, List, Dict, Any
 
-# сторонние клиенты
-# Убедись, что в requirements есть: openai, google-generative-ai, groq
-try:
-    from openai import AsyncOpenAI
-except Exception:
-    AsyncOpenAI = None
+import openai
+import google.generativeai as genai
+from xai_sdk import Client as XAI_Client
+from xai_sdk.chat import user as xai_user, assistant as xai_assistant
 
-# Grok client placeholder (SDKs меняются) — адаптируй при необходимости
-try:
-    from groq import Groq
-except Exception:
-    Groq = None
-
-try:
-    import google.generativeai as genai
-except Exception:
-    genai = None
-
-# --- LOGGER (без логирования пользовательского текста) ---
 logger = logging.getLogger("llm_core")
 logger.setLevel(logging.INFO)
-if not logger.handlers:
-    ch = logging.StreamHandler()
-    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    logger.addHandler(ch)
 
-# --- Настройки ---
-DEFAULT_MAX_TOKENS_HISTORY = 3000  # лимит токенов на одного пользователя в истории
-DEFAULT_MAX_MESSAGES = 10  # запасной лимит по числу сообщений, если нужно
-RETRY_ATTEMPTS = 2
-RETRY_BACKOFF = 1.0  # seconds base
-
-# Простейшая оценка "токенов" — приближённая, для управления контекстом
-def estimate_tokens(text: str) -> int:
-    # грубая аппроксимация: 1 токен ~ 0.75 слова
-    words = len(text.split())
-    tokens = int(words / 0.75) if words > 0 else 0
-    return tokens
-
-def history_token_count(history: List[Dict]) -> int:
-    total = 0
+# --- Утилиты ---
+def _history_to_openai_messages(history: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Преобразовать историю в формат OpenAI messages."""
+    msgs = []
     for m in history:
-        total += estimate_tokens(m.get("content", ""))
-    return total
+        r = m.get("role", "user")
+        c = m.get("content", "")
+        msgs.append({"role": r, "content": c})
+    return msgs
 
-def trim_history_by_tokens(history: List[Dict], max_tokens: int) -> List[Dict]:
-    """Обрезать историю, сохранив как можно больше последних сообщений, чтобы не превышать max_tokens."""
+def trim_history_by_tokens(history: List[Dict[str, str]], max_tokens: int) -> List[Dict[str, str]]:
+    """
+    Простая эвристика: считаем 1 слово ~= 1 токен (грубая), и обрезаем историю с головы.
+    В реальном проекте можно заменить на более точный подсчёт токенов.
+    """
     if not history:
         return history
-    # идём с конца
-    rev = list(reversed(history))
-    total = 0
-    kept = []
-    for m in rev:
-        t = estimate_tokens(m.get("content", ""))
-        if total + t > max_tokens and kept:
+    tokens = 0
+    out = []
+    # идём с конца, собираем пока не превысим max_tokens
+    for m in reversed(history):
+        tokens += len(m.get("content", "").split())
+        if tokens > max_tokens:
             break
-        total += t
-        kept.append(m)
-    kept_rev = list(reversed(kept))
-    return kept_rev
+        out.append(m)
+    return list(reversed(out))
 
-# --- Простая стратегия retry для сетевых ошибок ---
-async def _with_retries(coro_func, *args, attempts=RETRY_ATTEMPTS, backoff=RETRY_BACKOFF, **kwargs):
-    last_exc = None
-    for i in range(attempts + 1):
-        try:
-            return await coro_func(*args, **kwargs)
-        except Exception as e:
-            last_exc = e
-            wait = backoff * (2 ** i) + random.random() * 0.2
-            logger.warning("llm_core: попытка %d не удалась: %s, ждём %.2fs", i+1, repr(e), wait)
-            await asyncio.sleep(wait)
-    raise last_exc
-
-# --- Асинхронные реализации (упрощённые) ---
+# --- Основные функции ---
 
 async def generate_text(provider: str,
                         model: str,
-                        history: List[Dict],
+                        history: List[Dict[str, str]],
                         user_input: str,
                         openai_key: str = None,
                         grok_key: str = None,
                         gemini_key: str = None,
-                        max_history_tokens: int = DEFAULT_MAX_TOKENS_HISTORY) -> str:
-    """Возвращает итоговый ответ (строка). НЕТ streaming. Использует retry."""
-    # Обрезаем историю по токенам
-    trimmed_history = trim_history_by_tokens(history + [{"role": "user", "content": user_input}], max_history_tokens)
-    # формируем messages для OpenAI-подобных
-    messages = [{"role": m["role"], "content": m["content"]} for m in trimmed_history]
-
-    if provider == "openai":
-        if AsyncOpenAI is None:
-            raise RuntimeError("OpenAI SDK не установлен (AsyncOpenAI отсутствует).")
-        async def call_openai():
-            client = AsyncOpenAI(api_key=openai_key)
-            # пример использования API, возможно потребуются правки под версию SDK
-            resp = await client.chat.completions.create(model=model, messages=messages, max_tokens=1024)
-            # безопасно получить контент
+                        max_history_tokens: int = 2000) -> str:
+    """
+    Запрос к модели — возвращает итоговый текст.
+    provider: "openai" | "grok" | "gemini"
+    model: id модели (например "gpt-5", "gpt-4.1", "grok-4-fast-reasoning", "gemini-2.5-flash")
+    history: list of {"role":"user"/"assistant", "content": "..."}
+    """
+    history = trim_history_by_tokens(history + [{"role": "user", "content": user_input}], max_history_tokens)
+    try:
+        if provider == "openai":
+            if not openai_key:
+                raise ValueError("OpenAI key not provided")
+            client = openai.AsyncOpenAI(api_key=openai_key)
+            messages = _history_to_openai_messages(history)
+            # GPT-5 family expects max_completion_tokens, others - max_tokens
+            kwargs = {}
+            if model and model.startswith("gpt-5"):
+                kwargs["max_completion_tokens"] = 1024
+            else:
+                kwargs["max_tokens"] = 1024
+            resp = await client.chat.completions.create(model=model, messages=messages, **kwargs)
+            # Поддержка разных структур ответа (защита)
             try:
-                return resp.choices[0].message.content
+                content = resp.choices[0].message.content
             except Exception:
-                return str(resp)
-        return await _with_retries(call_openai)
+                # fallback
+                content = getattr(resp.choices[0].message, "content", str(resp))
+            return content or ""
 
-    elif provider == "grok":
-        if Groq is None:
-            raise RuntimeError("Grok SDK не установлен.")
-        async def call_grok():
-            client = Groq(api_key=grok_key)
-            # Синхронный/асинхронный клиент зависит от SDK — здесь упрощение
-            resp = client.chat.completions.create(model=model, messages=messages, max_tokens=1024)
-            try:
-                return resp.choices[0].message["content"]
-            except Exception:
-                return str(resp)
-        return await _with_retries(call_grok)
+        elif provider == "grok":
+            if not grok_key:
+                raise ValueError("Grok (xAI) key not provided")
+            xai = XAI_Client(api_key=grok_key)
+            # Собираем сообщения в формате xai_sdk: user(...) / assistant(...)
+            msgs = []
+            for m in history:
+                if m["role"] == "user":
+                    msgs.append(xai_user(m["content"]))
+                else:
+                    msgs.append(xai_assistant(m["content"]))
+            # Добавим последний юзерский
+            msgs.append(xai_user(user_input))
+            # Создаём чат и получаем ответ синхронно в отдельном тред (xai_sdk может быть sync)
+            def _run_chat():
+                chat = xai.chat.create(model=model, messages=msgs)
+                # sample() возвращает ответ (sync)
+                sample = chat.sample()
+                return getattr(sample, "content", str(sample))
+            loop = asyncio.get_running_loop()
+            content = await loop.run_in_executor(None, _run_chat)
+            return content or ""
 
-    elif provider == "gemini":
-        if genai is None:
-            raise RuntimeError("Google Generative SDK не установлен.")
-        async def call_gemini():
+        elif provider == "gemini":
+            if not gemini_key:
+                raise ValueError("Gemini key not provided")
             genai.configure(api_key=gemini_key)
-            model_engine = genai.GenerativeModel(model)
-            # Примерный flow - SDK может отличаться
-            convo = model_engine.start_chat(history=[{"role": m["role"], "parts":[{"text": m["content"]}]} for m in trimmed_history if "content" in m])
-            convo.send_message(user_input)
-            # Вернуть последний текст
-            return convo.last.text
-        return await _with_retries(call_gemini)
-    else:
-        raise ValueError("Unknown provider")
+            # Для Gemini используем простой подход: генai.generate_text (если доступно)
+            # Но для совместимости с новым API используем интерфейс chat/parts
+            # Попробуем сначала использовать generaciones через chat-like api:
+            messages = [{"role": "user", "parts": [{"text": msg["content"]}]} for msg in history]
+            # new api: genai.chat (if exists)
+            try:
+                model_obj = genai.GenerativeModel(model)
+                chat = model_obj.start_chat(history=messages)
+                response = await chat.send_message_async(user_input)
+                return getattr(response, "text", str(response))
+            except Exception as e:
+                # fallback: try simple generate_text
+                try:
+                    resp = genai.generate_text(model=model, prompt=user_input)
+                    return getattr(resp, "candidates", [])[0].get("output", "") if resp else ""
+                except Exception as e2:
+                    raise e2
+
+        else:
+            raise ValueError("Unknown provider")
+    except Exception as e:
+        logger.exception("generate_text failed: %s", e)
+        raise
 
 async def generate_text_stream(provider: str,
                                model: str,
-                               history: List[Dict],
+                               history: List[Dict[str, str]],
                                user_input: str,
                                openai_key: str = None,
                                grok_key: str = None,
                                gemini_key: str = None,
-                               max_history_tokens: int = DEFAULT_MAX_TOKENS_HISTORY) -> AsyncIterator[str]:
+                               max_history_tokens: int = 2000) -> AsyncIterator[str]:
     """
-    Асинхронный генератор, отдаёт куски текста, чтобы клиент (бот) мог отправлять/редактировать сообщение по мере готовности.
-    Не все SDK поддерживают стриминг — если стриминга нет, отдаёт один большой кусок.
+    Streaming-обёртка: по возможности стримим, иначе возвращаем итог одним чанком.
+    Для совместимости некоторые SDK не поддерживают async streaming одинаково,
+    поэтому мы используем generate_text() и возвращаем чанки.
     """
-    trimmed_history = trim_history_by_tokens(history + [{"role": "user", "content": user_input}], max_history_tokens)
-    messages = [{"role": m["role"], "content": m["content"]} for m in trimmed_history]
-
-    if provider == "openai" and AsyncOpenAI is not None:
-        client = AsyncOpenAI(api_key=openai_key)
-        # Попытка стриминга — синтаксис SDK может отличаться в зависимости от версии.
-        # Если не поддерживается — падаем в блок except и вернём цельный ответ.
-        try:
-            # stream=True — псевдокод; подстрой под SDK версии
-            stream = await client.chat.completions.create(model=model, messages=messages, max_tokens=1024, stream=True)
-            async for chunk in stream:
-                # chunk может содержать частичный текст в разных полях — упрощаем:
-                try:
-                    text = chunk.choices[0].delta.content
-                except Exception:
-                    text = getattr(chunk, "content", str(chunk))
-                if text:
-                    yield text
-            return
-        except Exception as e:
-            logger.info("OpenAI streaming fallback: %s", e)
-            # fallthrough to single-response
-
-    # Grok / Gemini / fallback: вернуть единый ответ
-    text = await generate_text(provider, model, history, user_input, openai_key, grok_key, gemini_key, max_history_tokens)
-    # отдаём порциями
-    chunk_size = 120
-    for i in range(0, len(text), chunk_size):
-        yield text[i:i+chunk_size]
+    try:
+        # Попробуем получить итог
+        final = await generate_text(provider, model, history, user_input,
+                                    openai_key=openai_key, grok_key=grok_key,
+                                    gemini_key=gemini_key, max_history_tokens=max_history_tokens)
+        # Разбиваем на разумные чанки (симулируем стриминг)
+        chunk_size = 80
+        i = 0
+        while i < len(final):
+            chunk = final[i:i + chunk_size]
+            yield chunk
+            i += chunk_size
+            await asyncio.sleep(0)  # уступаем планировщику
+    except Exception as e:
+        logger.exception("generate_text_stream failed: %s", e)
+        # поднимем исключение наружу — вызывающий код обработает fallback
+        raise
 
 async def generate_image(provider: str,
                          prompt: str,
                          openai_key: str = None,
                          grok_key: str = None,
-                         max_retries: int = RETRY_ATTEMPTS) -> str:
-    """Возвращает URL изображения (или data, если платформа возвращает)."""
-    if provider == "openai":
-        if AsyncOpenAI is None:
-            raise RuntimeError("OpenAI SDK отсутствует.")
-        async def call_images():
-            client = AsyncOpenAI(api_key=openai_key)
-            resp = await client.images.generate(model="gpt-image-1", prompt=prompt, size="1024x1024")
-            try:
-                return resp.data[0].url
-            except Exception:
-                return str(resp)
-        return await _with_retries(call_images)
-
-    elif provider == "grok":
-        if Groq is None:
-            raise RuntimeError("Grok SDK отсутствует.")
-        async def call_grok_img():
-            client = Groq(api_key=grok_key)
-            r = client.images.generate(model="grok-image-1", prompt=prompt, size="1024x1024")
-            try:
-                return r.data[0].url
-            except Exception:
-                return str(r)
-        return await _with_retries(call_grok_img)
-
-    else:
-        raise ValueError("Provider не поддерживает изображение или неизвестен.")
-
-# --- Небольшие утилиты для тестирования/мониторинга ---
-async def ping_provider(provider: str, openai_key=None, grok_key=None, gemini_key=None) -> Dict:
-    """Простейшая проверка доступности провайдера."""
+                         gemini_key: str = None) -> str:
+    """
+    Генерация изображения: возвращает URL (или выбрасывает исключение).
+    Поддерживаем OpenAI (DALL-E 3) и xAI (Grok Image).
+    """
     try:
         if provider == "openai":
-            if AsyncOpenAI is None:
-                return {"ok": False, "reason": "openai-sdk-missing"}
-            client = AsyncOpenAI(api_key=openai_key)
-            # пробная простая операция
-            await client.models.list()
-            return {"ok": True}
-        if provider == "grok":
-            if Groq is None:
-                return {"ok": False, "reason": "grok-sdk-missing"}
-            return {"ok": True}
-        if provider == "gemini":
-            if genai is None:
-                return {"ok": False, "reason": "gemini-sdk-missing"}
-            return {"ok": True}
-    except Exception as e:
-        return {"ok": False, "reason": str(e)}
+            if not openai_key:
+                raise ValueError("OpenAI key not provided")
+            client = openai.AsyncOpenAI(api_key=openai_key)
+            resp = await client.images.generate(model="dall-e-3", prompt=prompt, n=1, size="1024x1024")
+            # структура: resp.data[0].url
+            return resp.data[0].url
 
+        elif provider == "grok":
+            if not grok_key:
+                raise ValueError("Grok key not provided")
+            xai = XAI_Client(api_key=grok_key)
+            def _run_image():
+                # пример: xai_client.image.sample(...)
+                res = xai.image.sample(model="grok-2-image-1212", prompt=prompt, image_format="url")
+                return getattr(res, "url", None) or res
+            loop = asyncio.get_running_loop()
+            url = await loop.run_in_executor(None, _run_image)
+            return url
+
+        elif provider == "gemini":
+            # Вариант: генерируем через Gemini image (если доступно)
+            if not gemini_key:
+                raise ValueError("Gemini key not provided")
+            genai.configure(api_key=gemini_key)
+            try:
+                resp = genai.generate_image(model="gemini-image-1", prompt=prompt, size="1024x1024")
+                # структура зависит от версии
+                return resp.output[0].images[0].uri
+            except Exception:
+                raise RuntimeError("Gemini image generation not implemented or key/quotas exhausted")
+        else:
+            raise ValueError("Unknown image provider")
+    except Exception as e:
+        logger.exception("generate_image failed: %s", e)
+        raise
