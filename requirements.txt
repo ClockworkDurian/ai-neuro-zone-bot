@@ -1,5 +1,3 @@
 aiogram==3.13.1
-openai
-google-generativeai
-groq
-aiohttp
+openai==1.51.0
+google-generativeai==0.7.2
