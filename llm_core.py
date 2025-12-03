@@ -1,242 +1,190 @@
-"""
-llm_core.py
-Унифицированный слой для OpenAI (ChatGPT), xAI Grok (через OpenAI-compatible client),
-и Google Gemini (google.generativeai).
-Реализовано:
- - generate_text(...)  -> final string (async)
- - generate_text_stream(...) -> async iterator of chunks (async)
- - generate_image(...) -> returns URL (async)
- - trim_history_by_tokens(...) helper
-Поведение:
- - GPT-5 family -> max_completion_tokens
- - GPT-4.1 and others -> max_tokens
- - Grok uses AsyncOpenAI with base_url https://api.x.ai/v1
- - Gemini uses google.generativeai.generate_text where possible
-"""
-
 import asyncio
-import logging
-from typing import List, Dict, AsyncIterator
+import json
+import time
 
 import openai
 import google.generativeai as genai
 
-logger = logging.getLogger("llm_core")
-logger.setLevel(logging.INFO)
 
-# ---------------------------
-# Helpers
-# ---------------------------
-def _history_to_openai_messages(history: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    msgs = []
-    for m in history:
-        msgs.append({"role": m.get("role", "user"), "content": m.get("content", "")})
-    return msgs
+# ---------------------------------------------------------
+# TEXT GENERATION
+# ---------------------------------------------------------
 
-def trim_history_by_tokens(history: List[Dict[str, str]], max_tokens: int) -> List[Dict[str, str]]:
-    """Грубая эвристика: 1 слово ~= 1 токен"""
-    if not history:
-        return history
-    tokens = 0
-    out = []
-    for m in reversed(history):
-        tokens += len(m.get("content", "").split())
-        if tokens > max_tokens:
-            break
-        out.append(m)
-    return list(reversed(out))
+async def generate_text(provider, model, history, user_input,
+                        openai_key=None, grok_key=None, gemini_key=None,
+                        max_history_tokens=5000):
 
-# ---------------------------
-# Core functions
-# ---------------------------
-async def generate_text(provider: str,
-                        model: str,
-                        history: List[Dict[str, str]],
-                        user_input: str,
-                        openai_key: str = None,
-                        grok_key: str = None,
-                        gemini_key: str = None,
-                        max_history_tokens: int = 2000) -> str:
-    """
-    Выполняет итоговый (non-stream) запрос к провайдеру и возвращает текст.
-    Может поднять RuntimeError("GEMINI_QUOTA_EXCEEDED") при 429 от Gemini.
-    """
-    history = trim_history_by_tokens(history + [{"role": "user", "content": user_input}], max_history_tokens)
-
-    # ---------------- OpenAI (ChatGPT family) ----------------
     if provider == "openai":
-        if not openai_key:
-            raise ValueError("OPENAI_API_KEY not provided")
-        client = openai.AsyncOpenAI(api_key=openai_key)
-        messages = _history_to_openai_messages(history)
-        # decide token param
-        if model and model.startswith("gpt-5"):
-            params = {"max_completion_tokens": 1024}
+        try:
+            client = openai.AsyncOpenAI(api_key=openai_key)
+
+            messages = [{"role": "system", "content": "You are a helpful assistant."}]
+            for h in history:
+                messages.append({"role": h["role"], "content": h["content"]})
+            messages.append({"role": "user", "content": user_input})
+
+            resp = await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                stream=False
+            )
+            return resp.choices[0].message.content
+
+        except Exception as e:
+            raise RuntimeError(f"OpenAI error: {e}")
+
+    # -------------------------------
+    # GROK (xAI)
+    # -------------------------------
+    elif provider == "grok":
+        try:
+            import openai as grok_api
+            client = grok_api.AsyncOpenAI(
+                api_key=grok_key,
+                base_url="https://api.x.ai/v1"
+            )
+
+            messages = [{"role": "system", "content": "You are a helpful assistant."}]
+            for h in history:
+                messages.append({"role": h["role"], "content": h["content"]})
+            messages.append({"role": "user", "content": user_input})
+
+            resp = await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                stream=False
+            )
+            return resp.choices[0].message["content"]
+
+        except Exception as e:
+            raise RuntimeError(f"Grok error: {e}")
+
+    # --------------------------------------------------
+    # GEMINI — временно отключено (API изменилось)
+    # --------------------------------------------------
+    elif provider == "gemini":
+        raise RuntimeError("Gemini временно недоступен: изменился API Google. Исправим позже.")
+
+    else:
+        raise RuntimeError(f"Unknown provider: {provider}")
+
+
+# ---------------------------------------------------------
+# STREAMING
+# ---------------------------------------------------------
+
+async def generate_text_stream(provider, model, history, user_input,
+                               openai_key=None, grok_key=None, gemini_key=None,
+                               max_history_tokens=5000):
+
+    try:
+        # Пока стриминг есть только у OpenAI и Grok
+        if provider == "openai":
+            client = openai.AsyncOpenAI(api_key=openai_key)
+
+            messages = [{"role": "system", "content": "You are a helpful assistant."}]
+            for h in history:
+                messages.append({"role": h["role"], "content": h["content"]})
+            messages.append({"role": "user", "content": user_input})
+
+            stream = await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                stream=True,
+            )
+
+            async for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                    yield chunk.choices[0].delta.content
+
+        elif provider == "grok":
+            import openai as grok_api
+            client = grok_api.AsyncOpenAI(
+                api_key=grok_key,
+                base_url="https://api.x.ai/v1"
+            )
+
+            messages = [{"role": "system", "content": "You are a helpful assistant."}]
+            for h in history:
+                messages.append({"role": h["role"], "content": h["content"]})
+            messages.append({"role": "user", "content": user_input})
+
+            stream = await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                stream=True,
+            )
+
+            async for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.get("content"):
+                    yield chunk.choices[0].delta["content"]
+
         else:
-            params = {"max_tokens": 1024}
-        try:
-            resp = await client.chat.completions.create(model=model, messages=messages, **params)
-            # try to extract text
-            try:
-                return resp.choices[0].message.content or ""
-            except Exception:
-                # fallback to str
-                return str(resp)
-        except Exception as e:
-            logger.exception("OpenAI error: %s", e)
-            raise
+            # Gemini пока отключен
+            result = await generate_text(provider, model, history, user_input,
+                                         openai_key, grok_key, gemini_key, max_history_tokens)
+            yield result
 
-    # ---------------- Grok (xAI via OpenAI-compatible client) ----------------
-    if provider == "grok":
-        if not grok_key:
-            raise ValueError("GROK_API_KEY not provided")
-        # use AsyncOpenAI with base_url
-        client = openai.AsyncOpenAI(api_key=grok_key, base_url="https://api.x.ai/v1")
-        messages = _history_to_openai_messages(history)
-        # Grok expects max_tokens param typically
-        try:
-            resp = await client.chat.completions.create(model=model or "grok-2-mini", messages=messages, max_tokens=1024)
-            try:
-                return resp.choices[0].message.content or ""
-            except Exception:
-                return str(resp)
-        except Exception as e:
-            logger.exception("Grok error: %s", e)
-            raise
+    except Exception as e:
+        raise RuntimeError(str(e))
 
-    # ---------------- Gemini (google.generativeai) ----------------
-    if provider == "gemini":
-        if not gemini_key:
-            raise ValueError("GEMINI_API_KEY not provided")
 
-        # build a simple prompt concatenating history (more predictable)
-        parts = []
-        for m in history:
-            role = m.get("role", "user")
-            content = m.get("content", "")
-            if role == "user":
-                parts.append(f"User: {content}")
-            else:
-                parts.append(f"Assistant: {content}")
-        parts.append(f"User: {user_input}")
-        prompt = "\n".join(parts)
+# ---------------------------------------------------------
+# IMAGE GENERATION
+# ---------------------------------------------------------
 
-        try:
-            genai.configure(api_key=gemini_key)
-            # Try simple generate_text (more robust for short prompts)
-            resp = genai.generate_text(model=model, prompt=prompt)
-            # resp might have different structure; try common fields
-            if resp is None:
-                return ""
-            # prefer resp.candidates[0].output or resp.candidates[0].content or resp.text
-            # handle different SDK versions:
-            if hasattr(resp, "candidates") and resp.candidates:
-                cand = resp.candidates[0]
-                # cand might be dict-like
-                if isinstance(cand, dict):
-                    out = cand.get("output") or cand.get("content") or cand.get("text")
-                    if isinstance(out, str):
-                        return out
-                    return str(cand)
-                else:
-                    # object-like
-                    out = getattr(cand, "output", None) or getattr(cand, "content", None) or getattr(cand, "text", None)
-                    return out if isinstance(out, str) else str(cand)
-            # try direct fields
-            if hasattr(resp, "text"):
-                return getattr(resp, "text") or ""
-            # fallback
-            return str(resp)
-        except Exception as e:
-            # detect quota/resource exhausted errors (best-effort)
-            msg = str(e).lower()
-            logger.exception("Gemini error: %s", e)
-            if "quota" in msg or "resourceexhausted" in msg or "resource exhausted" in msg or "429" in msg:
-                # raise sentinel for bot to mark provider unavailable
-                raise RuntimeError("GEMINI_QUOTA_EXCEEDED")
-            raise
+async def generate_image(provider, model, prompt,
+                         openai_key=None, grok_key=None, gemini_key=None):
 
-    raise ValueError("Unknown provider: %s" % str(provider))
-
-# ---------------------------
-# Streaming wrapper (emulated)
-# ---------------------------
-async def generate_text_stream(provider: str,
-                               model: str,
-                               history: List[Dict[str, str]],
-                               user_input: str,
-                               openai_key: str = None,
-                               grok_key: str = None,
-                               gemini_key: str = None,
-                               max_history_tokens: int = 2000) -> AsyncIterator[str]:
-    """
-    Эмулируемый стрим: получает итог от generate_text и разбивает на чанки.
-    """
-    final = await generate_text(provider=provider, model=model, history=history, user_input=user_input,
-                                openai_key=openai_key, grok_key=grok_key, gemini_key=gemini_key,
-                                max_history_tokens=max_history_tokens)
-    # guard
-    if not isinstance(final, str):
-        final = str(final)
-    chunk_size = 80
-    i = 0
-    while i < len(final):
-        yield final[i:i + chunk_size]
-        i += chunk_size
-        await asyncio.sleep(0)
-
-# ---------------------------
-# Image generation
-# ---------------------------
-async def generate_image(provider: str,
-                         prompt: str,
-                         openai_key: str = None,
-                         grok_key: str = None,
-                         gemini_key: str = None) -> str:
-    """
-    Возвращает URL картинки.
-    """
-    # OPENAI images (DALL·E 3)
+    # -------------------------------
+    # OPENAI (DALL-E 3)
+    # -------------------------------
     if provider == "openai":
-        if not openai_key:
-            raise ValueError("OPENAI_API_KEY not provided")
-        client = openai.AsyncOpenAI(api_key=openai_key)
         try:
-            resp = await client.images.generate(model="dall-e-3", prompt=prompt, size="1024x1024", n=1)
-            # common structure: resp.data[0].url
-            return resp.data[0].url
-        except Exception as e:
-            logger.exception("OpenAI image error: %s", e)
-            raise
+            client = openai.AsyncOpenAI(api_key=openai_key)
 
-    # GROK images via xAI base_url
-    if provider == "grok":
-        if not grok_key:
-            raise ValueError("GROK_API_KEY not provided")
-        client = openai.AsyncOpenAI(api_key=grok_key, base_url="https://api.x.ai/v1")
+            resp = await client.images.generate(
+                model=model,
+                prompt=prompt,
+                size="1024x1024"
+            )
+
+            url = resp.data[0].url
+            return url
+
+        except Exception as e:
+            raise RuntimeError(f"OpenAI image error: {e}")
+
+    # -------------------------------
+    # GROK IMAGE — ИСПРАВЛЕНО
+    # -------------------------------
+    elif provider == "grok":
         try:
-            # try a reasonable model name; if your old working bot used different name, substitute here
-            resp = await client.images.generate(model="grok-image-1", prompt=prompt, size="1024x1024", n=1)
-            return resp.data[0].url
-        except Exception as e:
-            logger.exception("Grok image error: %s", e)
-            raise
+            import openai as grok_api
+            client = grok_api.AsyncOpenAI(
+                api_key=grok_key,
+                base_url="https://api.x.ai/v1"
+            )
 
-    # GEMINI image
-    if provider == "gemini":
-        if not gemini_key:
-            raise ValueError("GEMINI_API_KEY not provided")
-        try:
-            genai.configure(api_key=gemini_key)
-            resp = genai.generate_image(model="gemini-image-1", prompt=prompt, size="1024x1024")
-            # structure depends on sdk version:
-            try:
-                return resp.output[0].images[0].uri
-            except Exception:
-                # fallback
-                return str(resp)
-        except Exception as e:
-            logger.exception("Gemini image error: %s", e)
-            raise
+            resp = await client.images.generate(
+                model=model,          # grok-image-1
+                prompt=prompt,
+                width=1024,           # 🔥 ВАЖНО! вместо size
+                height=1024
+            )
 
-    raise ValueError("Unknown provider for image generation")
+            # Grok возвращает base64
+            b64 = resp.data[0].b64_json
+            return f"data:image/png;base64,{b64}"
+
+        except Exception as e:
+            raise RuntimeError(f"Grok image error: {e}")
+
+    # -------------------------------
+    # GEMINI IMAGE — временно отключен
+    # -------------------------------
+    elif provider == "gemini":
+        raise RuntimeError("Gemini image временно недоступен: Google API поменялся")
+
+    else:
+        raise RuntimeError(f"Unknown provider: {provider}")
