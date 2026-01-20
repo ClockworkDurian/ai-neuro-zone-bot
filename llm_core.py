@@ -1,5 +1,17 @@
-import openai
 import base64
+import httpx
+import openai
+
+# ---------------------------------------------------------
+# CUSTOM HTTPX CLIENT (NO PROXIES!)
+# ---------------------------------------------------------
+
+def make_http_client():
+    return httpx.AsyncClient(
+        timeout=60.0,
+        proxies=None,          # КЛЮЧЕВО
+        trust_env=False        # ИГНОРИРУЕМ HTTP_PROXY из Railway
+    )
 
 # ---------------------------------------------------------
 # HISTORY TRIM
@@ -15,9 +27,8 @@ def trim_history_by_tokens(history, max_tokens):
         out.append(m)
     return list(reversed(out))
 
-
 # ---------------------------------------------------------
-# TEXT (STREAM)
+# TEXT STREAM
 # ---------------------------------------------------------
 
 async def generate_text_stream(
@@ -38,13 +49,19 @@ async def generate_text_stream(
     messages = [{"role": "system", "content": "You are a helpful assistant."}]
     messages += history
 
+    http_client = make_http_client()
+
     if provider == "openai":
-        client = openai.AsyncOpenAI(api_key=openai_key)
+        client = openai.AsyncOpenAI(
+            api_key=openai_key,
+            http_client=http_client
+        )
 
     elif provider == "grok":
         client = openai.AsyncOpenAI(
             api_key=grok_key,
-            base_url="https://api.x.ai/v1"
+            base_url="https://api.x.ai/v1",
+            http_client=http_client
         )
     else:
         raise RuntimeError("Provider not supported")
@@ -61,9 +78,8 @@ async def generate_text_stream(
             if content:
                 yield content
 
-
 # ---------------------------------------------------------
-# TEXT (NON-STREAM) — ВАЖНО
+# TEXT NON-STREAM (COMPAT)
 # ---------------------------------------------------------
 
 async def generate_text(
@@ -90,7 +106,6 @@ async def generate_text(
         result += chunk
     return result
 
-
 # ---------------------------------------------------------
 # IMAGE
 # ---------------------------------------------------------
@@ -103,8 +118,13 @@ async def generate_image(
     grok_key=None,
     gemini_key=None
 ):
+    http_client = make_http_client()
+
     if provider == "openai":
-        client = openai.AsyncOpenAI(api_key=openai_key)
+        client = openai.AsyncOpenAI(
+            api_key=openai_key,
+            http_client=http_client
+        )
         r = await client.images.generate(
             model=model,
             prompt=prompt,
@@ -115,7 +135,8 @@ async def generate_image(
     elif provider == "grok":
         client = openai.AsyncOpenAI(
             api_key=grok_key,
-            base_url="https://api.x.ai/v1"
+            base_url="https://api.x.ai/v1",
+            http_client=http_client
         )
         r = await client.images.generate(
             model=model,
