@@ -1,150 +1,110 @@
+# llm_core.py
 import base64
+import os
 import httpx
 import openai
 
 # ---------------------------------------------------------
-# CUSTOM HTTPX CLIENT (NO PROXIES!)
+# HISTORY
 # ---------------------------------------------------------
 
-def make_http_client():
-    return httpx.AsyncClient(
-        timeout=60.0,
-        proxies=None,          # КЛЮЧЕВО
-        trust_env=False        # ИГНОРИРУЕМ HTTP_PROXY из Railway
-    )
-
-# ---------------------------------------------------------
-# HISTORY TRIM
-# ---------------------------------------------------------
-
-def trim_history_by_tokens(history, max_tokens):
+def trim_history_by_tokens(history, max_tokens: int):
     tokens = 0
-    out = []
-    for m in reversed(history):
-        tokens += len(m.get("content", "").split())
+    result = []
+    for msg in reversed(history):
+        tokens += len(msg.get("content", "").split())
         if tokens > max_tokens:
             break
-        out.append(m)
-    return list(reversed(out))
+        result.append(msg)
+    return list(reversed(result))
 
 # ---------------------------------------------------------
-# TEXT STREAM
-# ---------------------------------------------------------
-
-async def generate_text_stream(
-    provider,
-    model,
-    history,
-    user_input,
-    openai_key=None,
-    grok_key=None,
-    gemini_key=None,
-    max_history_tokens=5000
-):
-    history = trim_history_by_tokens(
-        history + [{"role": "user", "content": user_input}],
-        max_history_tokens
-    )
-
-    messages = [{"role": "system", "content": "You are a helpful assistant."}]
-    messages += history
-
-    http_client = make_http_client()
-
-    if provider == "openai":
-        client = openai.AsyncOpenAI(
-            api_key=openai_key,
-            http_client=http_client
-        )
-
-    elif provider == "grok":
-        client = openai.AsyncOpenAI(
-            api_key=grok_key,
-            base_url="https://api.x.ai/v1",
-            http_client=http_client
-        )
-    else:
-        raise RuntimeError("Provider not supported")
-
-    stream = await client.chat.completions.create(
-        model=model,
-        messages=messages,
-        stream=True
-    )
-
-    async for chunk in stream:
-        if chunk.choices and chunk.choices[0].delta:
-            content = getattr(chunk.choices[0].delta, "content", None)
-            if content:
-                yield content
-
-# ---------------------------------------------------------
-# TEXT NON-STREAM (COMPAT)
+# TEXT (NO STREAMING — STABLE)
 # ---------------------------------------------------------
 
 async def generate_text(
-    provider,
-    model,
-    history,
-    user_input,
-    openai_key=None,
-    grok_key=None,
-    gemini_key=None,
-    max_history_tokens=5000
+    provider: str,
+    model: str,
+    history: list,
+    user_input: str,
+    openai_key: str = None,
+    grok_key: str = None,
+    gemini_key: str = None,
+    max_history_tokens: int = 8000,
 ):
-    result = ""
-    async for chunk in generate_text_stream(
-        provider,
-        model,
-        history,
-        user_input,
-        openai_key,
-        grok_key,
-        gemini_key,
-        max_history_tokens
-    ):
-        result += chunk
-    return result
+    # history УЖЕ содержит user-сообщение — не добавляем повторно
+    messages = trim_history_by_tokens(history, max_history_tokens)
+
+    async with httpx.AsyncClient(timeout=60.0) as http_client:
+        if provider == "openai":
+            client = openai.AsyncOpenAI(
+                api_key=openai_key,
+                http_client=http_client,
+            )
+
+        elif provider == "grok":
+            client = openai.AsyncOpenAI(
+                api_key=grok_key,
+                base_url="https://api.x.ai/v1",
+                http_client=http_client,
+            )
+
+        else:
+            raise RuntimeError("Unsupported provider")
+
+        resp = await client.chat.completions.create(
+            model=model,
+            messages=messages,
+        )
+
+        # ❗ SDK 1.x — доступ через .content
+        return resp.choices[0].message.content
 
 # ---------------------------------------------------------
 # IMAGE
 # ---------------------------------------------------------
 
 async def generate_image(
-    provider,
-    model,
-    prompt,
-    openai_key=None,
-    grok_key=None,
-    gemini_key=None
+    provider: str,
+    model: str,
+    prompt: str,
+    openai_key: str = None,
+    grok_key: str = None,
+    gemini_key: str = None,
 ):
-    http_client = make_http_client()
+    async with httpx.AsyncClient(timeout=60.0) as http_client:
+        if provider == "openai":
+            client = openai.AsyncOpenAI(
+                api_key=openai_key,
+                http_client=http_client,
+            )
 
-    if provider == "openai":
-        client = openai.AsyncOpenAI(
-            api_key=openai_key,
-            http_client=http_client
-        )
-        r = await client.images.generate(
-            model=model,
-            prompt=prompt,
-            size="1024x1024"
-        )
-        return r.data[0].url
+            r = await client.images.generate(
+                model=model,
+                prompt=prompt,
+                size="1024x1024",
+            )
 
-    elif provider == "grok":
-        client = openai.AsyncOpenAI(
-            api_key=grok_key,
-            base_url="https://api.x.ai/v1",
-            http_client=http_client
-        )
-        r = await client.images.generate(
-            model=model,
-            prompt=prompt,
-            width=1024,
-            height=1024
-        )
-        return base64.b64decode(r.data[0].b64_json)
+            # OpenAI возвращает HTTPS URL — Telegram ОК
+            return r.data[0].url
 
-    else:
-        raise RuntimeError("Image provider not supported")
+        elif provider == "grok":
+            client = openai.AsyncOpenAI(
+                api_key=grok_key,
+                base_url="https://api.x.ai/v1",
+                http_client=http_client,
+            )
+
+            r = await client.images.generate(
+                model=model,
+                prompt=prompt,
+                width=1024,
+                height=1024,
+            )
+
+            # xAI возвращает base64 → Telegram ждёт bytes
+            image_bytes = base64.b64decode(r.data[0].b64_json)
+            return image_bytes
+
+        else:
+            raise RuntimeError("Unsupported image provider")
