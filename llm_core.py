@@ -17,13 +17,19 @@ def trim_history_by_tokens(history, max_tokens):
 
 
 # ---------------------------------------------------------
-# TEXT
+# TEXT (STREAM)
 # ---------------------------------------------------------
 
-async def generate_text_stream(provider, model, history, user_input,
-                               openai_key=None, grok_key=None, gemini_key=None,
-                               max_history_tokens=5000):
-
+async def generate_text_stream(
+    provider,
+    model,
+    history,
+    user_input,
+    openai_key=None,
+    grok_key=None,
+    gemini_key=None,
+    max_history_tokens=5000
+):
     history = trim_history_by_tokens(
         history + [{"role": "user", "content": user_input}],
         max_history_tokens
@@ -57,12 +63,46 @@ async def generate_text_stream(provider, model, history, user_input,
 
 
 # ---------------------------------------------------------
+# TEXT (NON-STREAM) — ВАЖНО
+# ---------------------------------------------------------
+
+async def generate_text(
+    provider,
+    model,
+    history,
+    user_input,
+    openai_key=None,
+    grok_key=None,
+    gemini_key=None,
+    max_history_tokens=5000
+):
+    result = ""
+    async for chunk in generate_text_stream(
+        provider,
+        model,
+        history,
+        user_input,
+        openai_key,
+        grok_key,
+        gemini_key,
+        max_history_tokens
+    ):
+        result += chunk
+    return result
+
+
+# ---------------------------------------------------------
 # IMAGE
 # ---------------------------------------------------------
 
-async def generate_image(provider, model, prompt,
-                         openai_key=None, grok_key=None, gemini_key=None):
-
+async def generate_image(
+    provider,
+    model,
+    prompt,
+    openai_key=None,
+    grok_key=None,
+    gemini_key=None
+):
     if provider == "openai":
         client = openai.AsyncOpenAI(api_key=openai_key)
         r = await client.images.generate(
@@ -77,16 +117,13 @@ async def generate_image(provider, model, prompt,
             api_key=grok_key,
             base_url="https://api.x.ai/v1"
         )
-
         r = await client.images.generate(
             model=model,
             prompt=prompt,
             width=1024,
             height=1024
         )
-
-        img_bytes = base64.b64decode(r.data[0].b64_json)
-        return img_bytes
+        return base64.b64decode(r.data[0].b64_json)
 
     else:
         raise RuntimeError("Image provider not supported")
