@@ -1,6 +1,5 @@
 # llm_core.py
 import base64
-import os
 import httpx
 import openai
 
@@ -19,7 +18,7 @@ def trim_history_by_tokens(history, max_tokens: int):
     return list(reversed(result))
 
 # ---------------------------------------------------------
-# TEXT (NO STREAMING — STABLE)
+# TEXT (NON-STREAM, ОСНОВА)
 # ---------------------------------------------------------
 
 async def generate_text(
@@ -32,7 +31,6 @@ async def generate_text(
     gemini_key: str = None,
     max_history_tokens: int = 8000,
 ):
-    # history УЖЕ содержит user-сообщение — не добавляем повторно
     messages = trim_history_by_tokens(history, max_history_tokens)
 
     async with httpx.AsyncClient(timeout=60.0) as http_client:
@@ -41,14 +39,12 @@ async def generate_text(
                 api_key=openai_key,
                 http_client=http_client,
             )
-
         elif provider == "grok":
             client = openai.AsyncOpenAI(
                 api_key=grok_key,
                 base_url="https://api.x.ai/v1",
                 http_client=http_client,
             )
-
         else:
             raise RuntimeError("Unsupported provider")
 
@@ -57,8 +53,37 @@ async def generate_text(
             messages=messages,
         )
 
-        # ❗ SDK 1.x — доступ через .content
         return resp.choices[0].message.content
+
+# ---------------------------------------------------------
+# TEXT STREAM (СОВМЕСТИМОСТЬ С bot.py)
+# ---------------------------------------------------------
+
+async def generate_text_stream(
+    provider: str,
+    model: str,
+    history: list,
+    user_input: str,
+    openai_key: str = None,
+    grok_key: str = None,
+    gemini_key: str = None,
+    max_history_tokens: int = 8000,
+):
+    """
+    Совместимость с bot.py.
+    Реального стриминга сейчас нет — отдаём весь текст одним чанком.
+    """
+    text = await generate_text(
+        provider=provider,
+        model=model,
+        history=history,
+        user_input=user_input,
+        openai_key=openai_key,
+        grok_key=grok_key,
+        gemini_key=gemini_key,
+        max_history_tokens=max_history_tokens,
+    )
+    yield text
 
 # ---------------------------------------------------------
 # IMAGE
@@ -84,8 +109,6 @@ async def generate_image(
                 prompt=prompt,
                 size="1024x1024",
             )
-
-            # OpenAI возвращает HTTPS URL — Telegram ОК
             return r.data[0].url
 
         elif provider == "grok":
@@ -102,9 +125,7 @@ async def generate_image(
                 height=1024,
             )
 
-            # xAI возвращает base64 → Telegram ждёт bytes
-            image_bytes = base64.b64decode(r.data[0].b64_json)
-            return image_bytes
+            return base64.b64decode(r.data[0].b64_json)
 
         else:
             raise RuntimeError("Unsupported image provider")
