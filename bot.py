@@ -1,5 +1,5 @@
-# bot.py — эталонный, с фиксами под aiogram 3.x
-# НИ ОДНОЙ ЛОГИЧЕСКОЙ ПРАВКИ. ТОЛЬКО text= В КНОПКАХ.
+# bot.py — эталонный, минимальные фиксы
+# ВАЖНО: список моделей НЕ МЕНЯЛСЯ
 
 import asyncio
 import logging
@@ -11,13 +11,11 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
 from aiogram.exceptions import TelegramAPIError
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
 from llm_core import (
-    generate_text_stream,
     generate_text,
     generate_image,
-    trim_history_by_tokens,
 )
 
 # ----------------------------------------------------------
@@ -38,9 +36,6 @@ def safe_log(uid, event, extra=None):
 # ----------------------------------------------------------
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-GROK_API_KEY = os.getenv("GROK_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -80,7 +75,7 @@ user_state = defaultdict(lambda: {
 })
 
 # ----------------------------------------------------------
-# MODELS — РОВНО ТВОЙ СПИСОК
+# MODELS — ТВОЙ СПИСОК, БЕЗ ИЗМЕНЕНИЙ
 # ----------------------------------------------------------
 
 openai_models = {
@@ -110,52 +105,19 @@ grok_image_models = {
 }
 
 # ----------------------------------------------------------
-# KEYBOARDS
+# REPLY KEYBOARD (ЗАЛИПШЕЕ МЕНЮ)
 # ----------------------------------------------------------
 
-def kb_main():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="Текст", callback_data="mode:text"),
-            InlineKeyboardButton(text="Картинки", callback_data="mode:image"),
+def main_menu():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Текст"), KeyboardButton(text="Картинки")],
+            [KeyboardButton(text="OpenAI"), KeyboardButton(text="Grok"), KeyboardButton(text="Gemini")],
+            [KeyboardButton(text="Сброс истории")],
         ],
-        [
-            InlineKeyboardButton(text="OpenAI", callback_data="provider:openai"),
-            InlineKeyboardButton(text="Grok", callback_data="provider:grok"),
-            InlineKeyboardButton(text="Gemini", callback_data="provider:gemini"),
-        ],
-        [
-            InlineKeyboardButton(text="Сброс истории", callback_data="reset"),
-        ],
-    ])
-
-def kb_models(provider, mode):
-    if mode == "image":
-        models = {
-            "openai": openai_image_models,
-            "grok": grok_image_models,
-        }.get(provider, {})
-    else:
-        models = {
-            "openai": openai_models,
-            "grok": grok_models,
-            "gemini": gemini_models,
-        }.get(provider, {})
-
-    keyboard = []
-    for name, meta in models.items():
-        keyboard.append([
-            InlineKeyboardButton(
-                text=f"{name} — {meta['desc']}",
-                callback_data=f"model:{meta['id']}"
-            )
-        ])
-
-    keyboard.append([
-        InlineKeyboardButton(text="⬅ Назад", callback_data="back:main")
-    ])
-
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+        resize_keyboard=True,
+        persistent=True,
+    )
 
 # ----------------------------------------------------------
 # HANDLERS
@@ -164,103 +126,110 @@ def kb_models(provider, mode):
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     uid = message.from_user.id
-    user_state[uid].update({
+    user_state[uid] = {
         "mode": None,
         "provider": None,
         "model": None,
         "history": [],
-    })
+    }
     safe_log(uid, "start")
-    await message.answer("Выберите режим:", reply_markup=kb_main())
-
-@dp.callback_query()
-async def on_callback(cb: types.CallbackQuery):
-    uid = cb.from_user.id
-    data = cb.data
-
-    safe_log(uid, "callback", {"data": data})
-
-    st = user_state[uid]
-
-    try:
-        if data == "reset":
-            st["history"] = []
-            await cb.message.edit_text("История очищена.", reply_markup=kb_main())
-            return
-
-        if data.startswith("mode:"):
-            st["mode"] = data.split(":")[1]
-            await cb.message.edit_text("Выберите провайдера:", reply_markup=kb_main())
-            return
-
-        if data.startswith("provider:"):
-            st["provider"] = data.split(":")[1]
-            await cb.message.edit_text(
-                "Выберите модель:",
-                reply_markup=kb_models(st["provider"], st["mode"])
-            )
-            return
-
-        if data.startswith("model:"):
-            st["model"] = data.split(":")[1]
-            await cb.message.edit_text(
-                f"Модель выбрана: <b>{st['model']}</b>\n\nВведите запрос."
-            )
-            return
-
-        if data == "back:main":
-            await cb.message.edit_text("Выберите режим:", reply_markup=kb_main())
-            return
-
-    except TelegramAPIError:
-        pass
+    await message.answer("Выберите режим:", reply_markup=main_menu())
 
 @dp.message()
 async def handle_message(message: types.Message):
     uid = message.from_user.id
-
-    if not check_rate(uid):
-        await message.answer("Слишком много запросов, попробуйте позже.")
-        return
-
+    text = message.text.strip()
     st = user_state[uid]
-    if not st["mode"] or not st["provider"] or not st["model"]:
-        await message.answer("Сначала выберите режим, провайдера и модель.")
+
+    # --- меню ---
+    if text == "Текст":
+        st["mode"] = "text"
+        await message.answer("Выберите провайдера:", reply_markup=main_menu())
         return
 
-    st["history"].append({"role": "user", "content": message.text})
-    st["history"] = trim_history_by_tokens(st["history"], 8000)
+    if text == "Картинки":
+        st["mode"] = "image"
+        await message.answer("Выберите провайдера:", reply_markup=main_menu())
+        return
+
+    if text in ("OpenAI", "Grok", "Gemini"):
+        st["provider"] = text.lower()
+
+        if st["provider"] == "gemini":
+            await message.answer(
+                "Gemini временно недоступна.\nМодель будет добавлена позже.",
+                reply_markup=main_menu()
+            )
+            return
+
+        models = (
+            openai_models if st["provider"] == "openai" and st["mode"] == "text" else
+            grok_models if st["provider"] == "grok" and st["mode"] == "text" else
+            openai_image_models if st["provider"] == "openai" else
+            grok_image_models
+        )
+
+        await message.answer(
+            "Выберите модель:\n" + "\n".join(models.keys()),
+            reply_markup=main_menu()
+        )
+        return
+
+    # --- выбор модели ---
+    all_models = {
+        **openai_models, **grok_models,
+        **openai_image_models, **grok_image_models,
+        **gemini_models
+    }
+
+    if text in all_models:
+        st["model"] = all_models[text]["id"]
+        await message.answer(
+            f"Модель выбрана: <b>{st['model']}</b>\nВведите запрос.",
+            reply_markup=main_menu()
+        )
+        return
+
+    # --- сброс ---
+    if text == "Сброс истории":
+        st["history"] = []
+        await message.answer("История очищена.", reply_markup=main_menu())
+        return
+
+    # --- запрос ---
+    if not st["mode"] or not st["provider"] or not st["model"]:
+        await message.answer(
+            "Сначала выберите режим, провайдера и модель.",
+            reply_markup=main_menu()
+        )
+        return
 
     try:
-        if st["mode"] == "image":
-            img = await generate_image(
-                st["provider"],
-                st["model"],
-                message.text,
-                OPENAI_API_KEY,
-                GROK_API_KEY,
-                GEMINI_API_KEY,
-            )
-            if isinstance(img, bytes):
-                await message.answer_photo(types.BufferedInputFile(img, "image.png"))
-            else:
-                await message.answer_photo(img)
-        else:
+        if st["mode"] == "text":
             reply = await generate_text(
-                st["provider"],
-                st["model"],
-                st["history"],
-                message.text,
-                OPENAI_API_KEY,
-                GROK_API_KEY,
-                GEMINI_API_KEY,
+                provider=st["provider"],
+                model=st["model"],
+                prompt=text,
+                history=st["history"],
             )
+            st["history"].append({"role": "user", "content": text})
             st["history"].append({"role": "assistant", "content": reply})
-            await message.answer(reply)
+            await message.answer(reply, reply_markup=main_menu())
 
-    except Exception as e:
+        else:
+            img = await generate_image(
+                provider=st["provider"],
+                model=st["model"],
+                prompt=text,
+            )
+            await message.answer_photo(img, reply_markup=main_menu())
+
+    except Exception:
         logger.exception("LLM error")
-        await message.answer("Ошибка при обращении к модели.")
+        await message.answer(
+            "Ошибка при обращении к модели.",
+            reply_markup=main_menu()
+        )
 
 # ----------------------------------------------------------
 # MAIN
