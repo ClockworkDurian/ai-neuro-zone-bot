@@ -1,33 +1,15 @@
 import os
 from typing import List, Dict
-from openai import AsyncOpenAI
+import openai
 
 # ==========================================================
-# CLIENTS
+# CONFIG
 # ==========================================================
 
-_openai_client = None
-_grok_client = None
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
-
-def get_openai_client():
-    global _openai_client
-    if _openai_client is None:
-        _openai_client = AsyncOpenAI(
-            api_key=os.getenv("OPENAI_API_KEY")
-        )
-    return _openai_client
-
-
-def get_grok_client():
-    global _grok_client
-    if _grok_client is None:
-        _grok_client = AsyncOpenAI(
-            api_key=os.getenv("GROK_API_KEY"),
-            base_url="https://api.x.ai/v1",
-        )
-    return _grok_client
-
+XAI_API_KEY = os.getenv("GROK_API_KEY")
+XAI_BASE_URL = "https://api.x.ai/v1"
 
 # ==========================================================
 # TEXT GENERATION
@@ -43,20 +25,39 @@ async def generate_text(
     if provider == "gemini":
         return "Модель временно не поддерживается и будет добавлена позже."
 
-    client = get_openai_client() if provider == "openai" else get_grok_client()
+    messages = []
 
-    # ✅ ПРОСТОЙ Responses API — БЕЗ chat/messages
-    response = await client.responses.create(
-        model=model,
-        input=prompt,
-    )
+    # история
+    for msg in history:
+        if "role" in msg and "content" in msg:
+            messages.append({
+                "role": msg["role"],
+                "content": msg["content"],
+            })
 
-    # Явно извлекаем текст
-    try:
-        return response.output[0].content[0].text
-    except Exception:
-        raise RuntimeError(f"Empty response from model {model}")
+    # текущий запрос
+    messages.append({
+        "role": "user",
+        "content": prompt,
+    })
 
+    if provider == "openai":
+        response = await openai.ChatCompletion.acreate(
+            model=model,
+            messages=messages,
+        )
+        return response.choices[0].message["content"]
+
+    if provider == "grok":
+        response = await openai.ChatCompletion.acreate(
+            model=model,
+            messages=messages,
+            api_key=XAI_API_KEY,
+            api_base=XAI_BASE_URL,
+        )
+        return response.choices[0].message["content"]
+
+    raise RuntimeError(f"Unknown provider: {provider}")
 
 # ==========================================================
 # IMAGE GENERATION
@@ -70,12 +71,10 @@ async def generate_image(
     if provider != "openai":
         return None
 
-    client = get_openai_client()
-
-    result = await client.images.generate(
+    result = await openai.Image.acreate(
         model=model,
         prompt=prompt,
         size="1024x1024",
     )
 
-    return result.data[0].url
+    return result["data"][0]["url"]
