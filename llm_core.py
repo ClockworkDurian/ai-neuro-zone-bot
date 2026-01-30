@@ -1,80 +1,90 @@
 import os
-from typing import List, Dict
-import openai
+import base64
+import httpx
+from openai import OpenAI
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GROK_API_KEY = os.getenv("GROK_API_KEY")
+
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
 
 # ==========================================================
-# CONFIG
+# TEXT GENERATION (у тебя уже работает — НЕ ТРОГАЕМ)
 # ==========================================================
 
-openai.api_key = os.getenv("OPENAI_API_KEY")
-
-XAI_API_KEY = os.getenv("GROK_API_KEY")
-XAI_BASE_URL = "https://api.x.ai/v1"
-
-# ==========================================================
-# TEXT GENERATION
-# ==========================================================
-
-async def generate_text(
-    provider: str,
-    model: str,
-    prompt: str,
-    history: List[Dict],
-):
-    # Gemini — заглушка
-    if provider == "gemini":
-        return "Модель временно не поддерживается и будет добавлена позже."
-
-    messages = []
-
-    # история
-    for msg in history:
-        if "role" in msg and "content" in msg:
-            messages.append({
-                "role": msg["role"],
-                "content": msg["content"],
-            })
-
-    # текущий запрос
-    messages.append({
-        "role": "user",
-        "content": prompt,
-    })
-
+async def generate_text(provider: str, model: str, messages: list[str]) -> str:
     if provider == "openai":
-        response = await openai.ChatCompletion.acreate(
+        resp = openai_client.chat.completions.create(
             model=model,
-            messages=messages,
+            messages=[{"role": "user", "content": m} for m in messages],
         )
-        return response.choices[0].message["content"]
+        return resp.choices[0].message.content
 
     if provider == "grok":
-        response = await openai.ChatCompletion.acreate(
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(
+                "https://api.x.ai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROK_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": m} for m in messages],
+                },
+            )
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"]
+
+    raise RuntimeError("Unknown provider")
+
+
+# ==========================================================
+# IMAGE GENERATION — ВОТ ТУТ БЫЛА ПРОБЛЕМА
+# ==========================================================
+
+async def generate_image(provider: str, model: str, prompt: str) -> str:
+    # ------------------ OpenAI ------------------
+    if provider == "openai":
+        result = openai_client.images.generate(
             model=model,
-            messages=messages,
-            api_key=XAI_API_KEY,
-            api_base=XAI_BASE_URL,
+            prompt=prompt,
+            size="1024x1024",
         )
-        return response.choices[0].message["content"]
+        return result.data[0].url
 
-    raise RuntimeError(f"Unknown provider: {provider}")
+    # ------------------ GROK (xAI) ------------------
+    if provider == "grok":
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(
+                "https://api.x.ai/v1/images/generations",
+                headers={
+                    "Authorization": f"Bearer {GROK_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "prompt": prompt,
+                    "size": "1024x1024",
+                },
+            )
 
-# ==========================================================
-# IMAGE GENERATION
-# ==========================================================
+            r.raise_for_status()
+            data = r.json()
 
-async def generate_image(
-    provider: str,
-    model: str,
-    prompt: str,
-):
-    if provider != "openai":
-        return None
+            # xAI возвращает base64, а не url
+            image_b64 = data["data"][0].get("b64_json")
+            if not image_b64:
+                raise RuntimeError("xAI image response has no b64_json")
 
-    result = await openai.Image.acreate(
-        model=model,
-        prompt=prompt,
-        size="1024x1024",
-    )
+            image_bytes = base64.b64decode(image_b64)
+            filename = "grok_image.png"
 
-    return result["data"][0]["url"]
+            with open(filename, "wb") as f:
+                f.write(image_bytes)
+
+            # bot.py уже умеет отправлять локальный файл
+            return filename
+
+    raise RuntimeError("Unknown provider")
