@@ -1,81 +1,238 @@
+import asyncio
+import logging
 import os
-from typing import List, Dict
-from openai import AsyncOpenAI
+import time
+from collections import defaultdict, deque
 
-# ==========================================================
-# CLIENTS
-# ==========================================================
+from aiogram import Bot, Dispatcher, types
+from aiogram.client.default import DefaultBotProperties
+from aiogram.filters import Command
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
-_openai_client = None
-_grok_client = None
+from llm_core import generate_text, generate_image
 
+# ----------------------------------------------------------
+# LOGGING
+# ----------------------------------------------------------
 
-def get_openai_client():
-    global _openai_client
-    if _openai_client is None:
-        _openai_client = AsyncOpenAI(
-            api_key=os.getenv("OPENAI_API_KEY")
-        )
-    return _openai_client
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("neurozone_bot")
 
+# ----------------------------------------------------------
+# ENV
+# ----------------------------------------------------------
 
-def get_grok_client():
-    global _grok_client
-    if _grok_client is None:
-        _grok_client = AsyncOpenAI(
-            api_key=os.getenv("GROK_API_KEY"),
-            base_url="https://api.x.ai/v1",
-        )
-    return _grok_client
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set")
 
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode="HTML"),
+)
+dp = Dispatcher()
 
-# ==========================================================
-# TEXT GENERATION
-# ==========================================================
+# ----------------------------------------------------------
+# RATE LIMIT
+# ----------------------------------------------------------
 
-async def generate_text(
-    provider: str,
-    model: str,
-    prompt: str,
-    history: List[Dict],
-):
-    # Gemini — заглушка
-    if provider == "gemini":
-        return "Модель временно не поддерживается и будет добавлена позже."
+RATE_LIMIT = 30
+user_requests = defaultdict(deque)
 
-    client = get_openai_client() if provider == "openai" else get_grok_client()
+def check_rate(uid: int) -> bool:
+    now = time.time()
+    dq = user_requests[uid]
+    while dq and dq[0] < now - 60:
+        dq.popleft()
+    if len(dq) >= RATE_LIMIT:
+        return False
+    dq.append(now)
+    return True
 
-    # ✅ ПРОСТОЙ Responses API — БЕЗ chat/messages
-    response = await client.responses.create(
-        model=model,
-        input=prompt,
+# ----------------------------------------------------------
+# USER STATE
+# ----------------------------------------------------------
+
+user_state = defaultdict(lambda: {
+    "mode": None,
+    "provider": None,
+    "model": None,
+    "history": [],
+})
+
+# ----------------------------------------------------------
+# MODELS — БЕЗ ИЗМЕНЕНИЙ
+# ----------------------------------------------------------
+
+openai_models = {
+    "GPT-5": {"id": "gpt-5"},
+    "GPT-5 mini": {"id": "gpt-5-mini"},
+    "GPT-5 nano": {"id": "gpt-5-nano"},
+    "GPT-4.1": {"id": "gpt-4.1"},
+}
+
+grok_models = {
+    "Grok code fast": {"id": "grok-code-fast-1"},
+    "Grok 4 fast reasoning": {"id": "grok-4-fast-reasoning"},
+    "Grok 4 fast non-reasoning": {"id": "grok-4-fast-non-reasoning"},
+}
+
+gemini_models = {
+    "Gemini 2.5 Flash": {"id": "gemini-2.5-flash"},
+    "Gemini 2.5 Flash Lite": {"id": "gemini-2.5-flash-lite"},
+}
+
+openai_image_models = {
+    "DALL·E 3": {"id": "dall-e-3"},
+}
+
+grok_image_models = {
+    "Grok Image": {"id": "grok-image-1"},
+}
+
+# ----------------------------------------------------------
+# KEYBOARDS
+# ----------------------------------------------------------
+
+def main_menu():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Текст"), KeyboardButton(text="Картинки")],
+            [KeyboardButton(text="OpenAI"), KeyboardButton(text="Grok"), KeyboardButton(text="Gemini")],
+            [KeyboardButton(text="Сброс истории")],
+        ],
+        resize_keyboard=True,
+        persistent=True,
     )
 
-    # Явно извлекаем текст
+def models_menu(models: dict):
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=name)] for name in models.keys()],
+        resize_keyboard=True,
+        persistent=True,
+    )
+
+# ----------------------------------------------------------
+# HANDLERS
+# ----------------------------------------------------------
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    uid = message.from_user.id
+    user_state[uid] = {
+        "mode": None,
+        "provider": None,
+        "model": None,
+        "history": [],
+    }
+    await message.answer("Выберите режим:", reply_markup=main_menu())
+
+@dp.message()
+async def handle_message(message: types.Message):
+    uid = message.from_user.id
+    text = message.text.strip()
+    st = user_state[uid]
+
+    # --- MENU ACTIONS ---
+
+    if text == "Текст":
+        st["mode"] = "text"
+        await message.answer("Выберите провайдера:", reply_markup=main_menu())
+        return
+
+    if text == "Картинки":
+        st["mode"] = "image"
+        await message.answer("Выберите провайдера:", reply_markup=main_menu())
+        return
+
+    if text in ("OpenAI", "Grok", "Gemini"):
+        st["provider"] = text.lower()
+
+        if st["provider"] == "gemini":
+            await message.answer(
+                "Gemini временно недоступна.\nМодель будет добавлена позже.",
+                reply_markup=main_menu()
+            )
+            return
+
+        if st["mode"] == "text":
+            models = openai_models if st["provider"] == "openai" else grok_models
+        else:
+            models = openai_image_models if st["provider"] == "openai" else grok_image_models
+
+        await message.answer(
+            "Выберите модель:",
+            reply_markup=models_menu(models)
+        )
+        return
+
+    # --- MODEL SELECTION ---
+
+    all_models = {
+        **openai_models,
+        **grok_models,
+        **openai_image_models,
+        **grok_image_models,
+        **gemini_models,
+    }
+
+    if text in all_models:
+        st["model"] = all_models[text]["id"]
+        await message.answer(
+            f"Модель выбрана: <b>{st['model']}</b>\nВведите запрос.",
+            reply_markup=main_menu()
+        )
+        return
+
+    # --- RESET ---
+
+    if text == "Сброс истории":
+        st["history"] = []
+        await message.answer("История очищена.", reply_markup=main_menu())
+        return
+
+    # --- QUERY ---
+
+    if not st["mode"] or not st["provider"] or not st["model"]:
+        await message.answer(
+            "Сначала выберите режим, провайдера и модель.",
+            reply_markup=main_menu()
+        )
+        return
+
+    if not check_rate(uid):
+        await message.answer("Слишком много запросов, попробуйте позже.", reply_markup=main_menu())
+        return
+
     try:
-        return response.output[0].content[0].text
+        if st["mode"] == "text":
+            reply = await generate_text(
+                provider=st["provider"],
+                model=st["model"],
+                prompt=text,
+                history=st["history"],
+            )
+            st["history"].append({"role": "user", "content": text})
+            st["history"].append({"role": "assistant", "content": reply})
+            await message.answer(reply, reply_markup=main_menu())
+        else:
+            img = await generate_image(
+                provider=st["provider"],
+                model=st["model"],
+                prompt=text,
+            )
+            await message.answer_photo(img, reply_markup=main_menu())
+
     except Exception:
-        raise RuntimeError(f"Empty response from model {model}")
+        logger.exception("LLM error")
+        await message.answer("Ошибка при обращении к модели.", reply_markup=main_menu())
 
+# ----------------------------------------------------------
+# MAIN
+# ----------------------------------------------------------
 
-# ==========================================================
-# IMAGE GENERATION
-# ==========================================================
+async def main():
+    await dp.start_polling(bot)
 
-async def generate_image(
-    provider: str,
-    model: str,
-    prompt: str,
-):
-    if provider != "openai":
-        return None
-
-    client = get_openai_client()
-
-    result = await client.images.generate(
-        model=model,
-        prompt=prompt,
-        size="1024x1024",
-    )
-
-    return result.data[0].url
+if __name__ == "__main__":
+    asyncio.run(main())
