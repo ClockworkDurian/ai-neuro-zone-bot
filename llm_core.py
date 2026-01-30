@@ -1,7 +1,5 @@
 import os
-import asyncio
 from typing import List, Dict
-
 from openai import AsyncOpenAI
 
 # ==========================================================
@@ -15,7 +13,9 @@ _grok_client = None
 def get_openai_client():
     global _openai_client
     if _openai_client is None:
-        _openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        _openai_client = AsyncOpenAI(
+            api_key=os.getenv("OPENAI_API_KEY")
+        )
     return _openai_client
 
 
@@ -39,20 +39,12 @@ async def generate_text(
     prompt: str,
     history: List[Dict],
 ):
-    """
-    provider: openai | grok | gemini
-    model: model id (as selected in bot)
-    prompt: user text
-    history: list of previous messages
-    """
-
-    # Gemini временно не поддерживается
+    # Gemini — заглушка
     if provider == "gemini":
         return "Модель временно не поддерживается и будет добавлена позже."
 
-    # Формируем messages
+    # формируем messages
     messages = []
-
     for msg in history:
         if "role" in msg and "content" in msg:
             messages.append({
@@ -65,19 +57,15 @@ async def generate_text(
         "content": prompt,
     })
 
-    if provider == "openai":
-        client = get_openai_client()
-    elif provider == "grok":
-        client = get_grok_client()
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
+    client = get_openai_client() if provider == "openai" else get_grok_client()
 
-    response = await client.chat.completions.create(
+    # ✅ НОВЫЙ Responses API
+    response = await client.responses.create(
         model=model,
-        messages=messages,
+        input=messages,
     )
 
-    return response.choices[0].message.content
+    return response.output_text
 
 
 # ==========================================================
@@ -89,10 +77,6 @@ async def generate_image(
     model: str,
     prompt: str,
 ):
-    """
-    Image generation (OpenAI only for now)
-    """
-
     if provider != "openai":
         return None
 
