@@ -43,29 +43,19 @@ async def generate_text(
     if provider == "gemini":
         return "Модель временно не поддерживается и будет добавлена позже."
 
-    # формируем messages
-    messages = []
-    for msg in history:
-        if "role" in msg and "content" in msg:
-            messages.append({
-                "role": msg["role"],
-                "content": msg["content"],
-            })
-
-    messages.append({
-        "role": "user",
-        "content": prompt,
-    })
-
     client = get_openai_client() if provider == "openai" else get_grok_client()
 
-    # ✅ НОВЫЙ Responses API
+    # ✅ ПРОСТОЙ Responses API — БЕЗ chat/messages
     response = await client.responses.create(
         model=model,
-        input=messages,
+        input=prompt,
     )
 
-    return response.output_text
+    # Явно извлекаем текст
+    try:
+        return response.output[0].content[0].text
+    except Exception:
+        raise RuntimeError(f"Empty response from model {model}")
 
 
 # ==========================================================
