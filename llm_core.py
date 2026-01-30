@@ -1,131 +1,107 @@
-# llm_core.py
-import base64
-import httpx
-import openai
+import os
+import asyncio
+from typing import List, Dict
 
-# ---------------------------------------------------------
-# HISTORY
-# ---------------------------------------------------------
+from openai import AsyncOpenAI
 
-def trim_history_by_tokens(history, max_tokens: int):
-    tokens = 0
-    result = []
-    for msg in reversed(history):
-        tokens += len(msg.get("content", "").split())
-        if tokens > max_tokens:
-            break
-        result.append(msg)
-    return list(reversed(result))
+# ==========================================================
+# CLIENTS
+# ==========================================================
 
-# ---------------------------------------------------------
-# TEXT (NON-STREAM, ОСНОВА)
-# ---------------------------------------------------------
+_openai_client = None
+_grok_client = None
+
+
+def get_openai_client():
+    global _openai_client
+    if _openai_client is None:
+        _openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    return _openai_client
+
+
+def get_grok_client():
+    global _grok_client
+    if _grok_client is None:
+        _grok_client = AsyncOpenAI(
+            api_key=os.getenv("GROK_API_KEY"),
+            base_url="https://api.x.ai/v1",
+        )
+    return _grok_client
+
+
+# ==========================================================
+# TEXT GENERATION
+# ==========================================================
 
 async def generate_text(
     provider: str,
     model: str,
-    history: list,
-    user_input: str,
-    openai_key: str = None,
-    grok_key: str = None,
-    gemini_key: str = None,
-    max_history_tokens: int = 8000,
-):
-    messages = trim_history_by_tokens(history, max_history_tokens)
-
-    async with httpx.AsyncClient(timeout=60.0) as http_client:
-        if provider == "openai":
-            client = openai.AsyncOpenAI(
-                api_key=openai_key,
-                http_client=http_client,
-            )
-        elif provider == "grok":
-            client = openai.AsyncOpenAI(
-                api_key=grok_key,
-                base_url="https://api.x.ai/v1",
-                http_client=http_client,
-            )
-        else:
-            raise RuntimeError("Unsupported provider")
-
-        resp = await client.chat.completions.create(
-            model=model,
-            messages=messages,
-        )
-
-        return resp.choices[0].message.content
-
-# ---------------------------------------------------------
-# TEXT STREAM (СОВМЕСТИМОСТЬ С bot.py)
-# ---------------------------------------------------------
-
-async def generate_text_stream(
-    provider: str,
-    model: str,
-    history: list,
-    user_input: str,
-    openai_key: str = None,
-    grok_key: str = None,
-    gemini_key: str = None,
-    max_history_tokens: int = 8000,
+    prompt: str,
+    history: List[Dict],
 ):
     """
-    Совместимость с bot.py.
-    Реального стриминга сейчас нет — отдаём весь текст одним чанком.
+    provider: openai | grok | gemini
+    model: model id (as selected in bot)
+    prompt: user text
+    history: list of previous messages
     """
-    text = await generate_text(
-        provider=provider,
+
+    # Gemini временно не поддерживается
+    if provider == "gemini":
+        return "Модель временно не поддерживается и будет добавлена позже."
+
+    # Формируем messages
+    messages = []
+
+    for msg in history:
+        if "role" in msg and "content" in msg:
+            messages.append({
+                "role": msg["role"],
+                "content": msg["content"],
+            })
+
+    messages.append({
+        "role": "user",
+        "content": prompt,
+    })
+
+    if provider == "openai":
+        client = get_openai_client()
+    elif provider == "grok":
+        client = get_grok_client()
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
+
+    response = await client.chat.completions.create(
         model=model,
-        history=history,
-        user_input=user_input,
-        openai_key=openai_key,
-        grok_key=grok_key,
-        gemini_key=gemini_key,
-        max_history_tokens=max_history_tokens,
+        messages=messages,
     )
-    yield text
 
-# ---------------------------------------------------------
-# IMAGE
-# ---------------------------------------------------------
+    return response.choices[0].message.content
+
+
+# ==========================================================
+# IMAGE GENERATION
+# ==========================================================
 
 async def generate_image(
     provider: str,
     model: str,
     prompt: str,
-    openai_key: str = None,
-    grok_key: str = None,
-    gemini_key: str = None,
 ):
-    async with httpx.AsyncClient(timeout=60.0) as http_client:
-        if provider == "openai":
-            client = openai.AsyncOpenAI(
-                api_key=openai_key,
-                http_client=http_client,
-            )
+    """
+    Image generation (OpenAI only for now)
+    """
 
-            r = await client.images.generate(
-                model=model,
-                prompt=prompt,
-                size="1024x1024",
-            )
-            return r.data[0].url
+    if provider != "openai":
+        return None
 
-        elif provider == "grok":
-            client = openai.AsyncOpenAI(
-                api_key=grok_key,
-                base_url="https://api.x.ai/v1",
-                http_client=http_client,
-            )
+    client = get_openai_client()
 
-            r = await client.images.generate(
-                model=model,
-                prompt=prompt,
-                width=1024,
-                height=1024,
-            )
+    result = await client.images.generate(
+        model=model,
+        prompt=prompt,
+        size="1024x1024",
+    )
 
-            return base64.b64decode(r.data[0].b64_json)
-
-        else:
-            raise RuntimeError("Unsupported image provider")
+    return result.data[0].url
