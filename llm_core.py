@@ -1,90 +1,101 @@
 import os
-import base64
-import httpx
+from typing import List, Dict, Optional
+
 from openai import OpenAI
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-GROK_API_KEY = os.getenv("GROK_API_KEY")
-
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+from groq import Groq
 
 
-# ==========================================================
-# TEXT GENERATION (у тебя уже работает — НЕ ТРОГАЕМ)
-# ==========================================================
+# ----------------------------------------------------------
+# CLIENTS
+# ----------------------------------------------------------
 
-async def generate_text(provider: str, model: str, messages: list[str]) -> str:
+_openai_client: Optional[OpenAI] = None
+_groq_client: Optional[Groq] = None
+
+
+def get_openai_client() -> OpenAI:
+    global _openai_client
+    if _openai_client is None:
+        _openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    return _openai_client
+
+
+def get_groq_client() -> Groq:
+    global _groq_client
+    if _groq_client is None:
+        _groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    return _groq_client
+
+
+# ----------------------------------------------------------
+# TEXT GENERATION
+# ----------------------------------------------------------
+
+async def generate_text(
+    *,
+    provider: str,
+    model: str,
+    prompt: str,
+    history: List[Dict[str, str]] | None = None,
+) -> str:
+    """
+    provider: "openai" | "grok"
+    model: модель из существующего списка
+    prompt: текст пользователя
+    history: история сообщений (role/content)
+    """
+
+    messages: List[Dict[str, str]] = []
+
+    if history:
+        messages.extend(history)
+
+    messages.append({"role": "user", "content": prompt})
+
     if provider == "openai":
-        resp = openai_client.chat.completions.create(
+        client = get_openai_client()
+        resp = client.chat.completions.create(
             model=model,
-            messages=[{"role": "user", "content": m} for m in messages],
+            messages=messages,
         )
         return resp.choices[0].message.content
 
     if provider == "grok":
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post(
-                "https://api.x.ai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {GROK_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": m} for m in messages],
-                },
-            )
-            r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"]
+        client = get_groq_client()
+        resp = client.chat.completions.create(
+            model=model,
+            messages=messages,
+        )
+        return resp.choices[0].message.content
 
-    raise RuntimeError("Unknown provider")
+    raise ValueError(f"Unknown provider: {provider}")
 
 
-# ==========================================================
-# IMAGE GENERATION — ВОТ ТУТ БЫЛА ПРОБЛЕМА
-# ==========================================================
+# ----------------------------------------------------------
+# IMAGE GENERATION
+# ----------------------------------------------------------
 
-async def generate_image(provider: str, model: str, prompt: str) -> str:
-    # ------------------ OpenAI ------------------
+async def generate_image(
+    *,
+    provider: str,
+    model: str,
+    prompt: str,
+) -> str:
+    """
+    Возвращает URL изображения
+    """
+
     if provider == "openai":
-        result = openai_client.images.generate(
+        client = get_openai_client()
+        result = client.images.generate(
             model=model,
             prompt=prompt,
             size="1024x1024",
         )
         return result.data[0].url
 
-    # ------------------ GROK (xAI) ------------------
     if provider == "grok":
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post(
-                "https://api.x.ai/v1/images/generations",
-                headers={
-                    "Authorization": f"Bearer {GROK_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": model,
-                    "prompt": prompt,
-                    "size": "1024x1024",
-                },
-            )
+        # На данный момент Grok НЕ поддерживает генерацию изображений через API
+        raise RuntimeError("Grok image generation is not supported via API")
 
-            r.raise_for_status()
-            data = r.json()
-
-            # xAI возвращает base64, а не url
-            image_b64 = data["data"][0].get("b64_json")
-            if not image_b64:
-                raise RuntimeError("xAI image response has no b64_json")
-
-            image_bytes = base64.b64decode(image_b64)
-            filename = "grok_image.png"
-
-            with open(filename, "wb") as f:
-                f.write(image_bytes)
-
-            # bot.py уже умеет отправлять локальный файл
-            return filename
-
-    raise RuntimeError("Unknown provider")
+    raise ValueError(f"Unknown provider: {provider}")
